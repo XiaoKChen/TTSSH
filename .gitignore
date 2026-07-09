@@ -1,0 +1,14 @@
+# Build artifacts (anchored to root so cmd/ttssh/ stays tracked)
+/ttssh
+/ttssh.exe
+/dist/
+
+# Local credentials and key material — never commit these
+.env
+*.key
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
