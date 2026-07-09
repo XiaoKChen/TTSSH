@@ -139,6 +139,28 @@ Prebuilt binaries for Linux (amd64), macOS (arm64/amd64), and Windows (amd64)
 land in `dist/` — everything, including the fuzzy finder and the vault client,
 is statically compiled in; the only runtime requirement is `ssh`/`scp` on PATH.
 
+## Installing (run `ttssh` from anywhere)
+
+The install scripts build the binary and put it on your PATH:
+
+```
+# Windows (PowerShell, no admin needed)
+.\scripts\install.ps1
+
+# Linux / macOS
+sh scripts/install.sh
+```
+
+- **Windows** installs to `%LOCALAPPDATA%\Programs\ttssh` and adds that folder
+  to your user PATH — open a new terminal after the first install.
+- **Linux/macOS** installs to `/usr/local/bin` (via sudo if needed), falling
+  back to `~/.local/bin` when sudo isn't available.
+
+Pass `-NoBuild` / `--no-build` to install an already-built binary (`./ttssh`,
+`ttssh.exe`, or the matching `dist/` binary) instead of compiling from source.
+Alternatively, plain `go install ./cmd/ttssh` works too if `$GOPATH/bin` is
+already on your PATH.
+
 `go test ./...` includes interop tests that decrypt the exact reference
 vectors shared with Key-Upload-TUI's test suite — if those pass, ttssh can
 read what the uploader wrote.
