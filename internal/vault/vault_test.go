@@ -144,7 +144,7 @@ func TestListUnitsViaPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	units, err := v.ListUnits()
+	units, err := v.ListUnits(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestFetchKeyViaPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, err := v.FetchKey(vec.unitID)
+	plain, err := v.FetchKey(t.Context(), vec.unitID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,20 +201,49 @@ func TestFetchKeyViaPipeline(t *testing.T) {
 }
 
 func TestOpenVaultValidation(t *testing.T) {
-	if _, err := Open(config.VaultConfig{}); err == nil {
-		t.Error("empty config must error")
+	tests := []struct {
+		name         string
+		vc           config.VaultConfig
+		wantErr      bool
+		wantEndpoint string
+	}{
+		{
+			name:    "rejects empty config",
+			vc:      config.VaultConfig{},
+			wantErr: true,
+		},
+		{
+			name:    "rejects bad master key hex",
+			vc:      config.VaultConfig{URL: "https://x", MasterKeyHex: "zz"},
+			wantErr: true,
+		},
+		{
+			name:    "rejects unsupported scheme",
+			vc:      config.VaultConfig{URL: "ftp://x", MasterKeyHex: hex.EncodeToString(interopMaster)},
+			wantErr: true,
+		},
+		{
+			name:         "rewrites libsql scheme to https",
+			vc:           config.VaultConfig{URL: "libsql://db.example.com", MasterKeyHex: hex.EncodeToString(interopMaster)},
+			wantEndpoint: "https://db.example.com/v2/pipeline",
+		},
 	}
-	if _, err := Open(config.VaultConfig{URL: "https://x", MasterKeyHex: "zz"}); err == nil {
-		t.Error("bad master key hex must error")
-	}
-	if _, err := Open(config.VaultConfig{URL: "ftp://x", MasterKeyHex: hex.EncodeToString(interopMaster)}); err == nil {
-		t.Error("bad scheme must error")
-	}
-	v, err := Open(config.VaultConfig{URL: "libsql://db.example.com", MasterKeyHex: hex.EncodeToString(interopMaster)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.endpoint != "https://db.example.com/v2/pipeline" {
-		t.Errorf("libsql scheme not rewritten: %s", v.endpoint)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Open(tc.vc)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.endpoint != tc.wantEndpoint {
+				t.Errorf("endpoint = %s, want %s", v.endpoint, tc.wantEndpoint)
+			}
+		})
 	}
 }

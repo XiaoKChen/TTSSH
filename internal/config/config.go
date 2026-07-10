@@ -73,7 +73,7 @@ func (c *Config) RemoveRecent(r Recent) {
 		out = append(out, existing)
 	}
 	c.Recents = out
-	_ = c.Save()
+	_ = c.Save() // recents are best-effort; don't fail the session
 }
 
 // Path returns the location of config.json in the OS config directory.
@@ -96,9 +96,14 @@ func Load() Config {
 	if err != nil {
 		return cfg
 	}
-	_ = json.Unmarshal(data, &cfg)
+	_ = json.Unmarshal(data, &cfg) // corrupt config falls back to zero-value defaults instead of blocking startup
 	return cfg
 }
+
+const (
+	dirPerm  = 0o755
+	filePerm = 0o644
+)
 
 // Save persists the config, creating the config directory if needed.
 func (c Config) Save() error {
@@ -106,14 +111,14 @@ func (c Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, filePerm)
 }
 
 // defaultKeyDir returns ~/.ssh.

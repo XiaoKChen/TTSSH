@@ -164,3 +164,27 @@ already on your PATH.
 `go test ./...` includes interop tests that decrypt the exact reference
 vectors shared with Key-Upload-TUI's test suite — if those pass, ttssh can
 read what the uploader wrote.
+
+## Setup
+
+Requires the Go toolchain (version per `go.mod`) and `ssh`/`scp` on PATH.
+
+```
+go mod download
+```
+
+## Development
+
+```
+go build ./...       # compile everything
+go test ./...        # run all tests (includes vault crypto interop vectors)
+go test -race ./...  # race detector for concurrent code
+go vet ./...         # static analysis
+gofmt -l .           # list files needing formatting
+```
+
+## Dependencies
+
+- `github.com/charmbracelet/huh` — interactive terminal forms and menus
+- `github.com/charmbracelet/lipgloss` — terminal styling for the banner and cards
+- `github.com/ktr0731/go-fuzzyfinder` — built-in fzf-style fuzzy finder

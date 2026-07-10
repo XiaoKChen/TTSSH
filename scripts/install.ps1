@@ -32,9 +32,12 @@ if ($NoBuild) {
     Copy-Item $source $target -Force
     Write-Host "Installed $source -> $target"
 } else {
-    go build -o $target "$repoRoot\cmd\ttssh"
+    $ver = try { git -C $repoRoot describe --tags --always --dirty 2>$null } catch { $null }
+    if (-not $ver) { $ver = 'dev' }
+
+    go build -ldflags "-X main.version=$ver" -o $target "$repoRoot\cmd\ttssh"
     if ($LASTEXITCODE -ne 0) { Write-Error "go build failed" }
-    Write-Host "Built and installed -> $target"
+    Write-Host "Built $ver and installed -> $target"
 }
 
 # Add the install dir to the user PATH if it is not already there.

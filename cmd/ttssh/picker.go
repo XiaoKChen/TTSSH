@@ -4,6 +4,7 @@ package main
 // entries and local *.key files, with folder switching built in.
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -44,8 +45,9 @@ const (
 
 // pickKey fuzzy-selects an SSH key from the vault (when configured) and from
 // *.key files under keyDir. The top entries switch folders or download vault
-// keys; keyDir is updated in place when the user switches folders.
-func pickKey(cfg *config.Config, keyDir *string, vlt *vault.Client) (keyChoice, error) {
+// keys; keyDir is updated in place when the user switches folders. vaultTempDir
+// is threaded through to materializeVaultKey (see vaultcmd.go).
+func pickKey(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (keyChoice, error) {
 	for {
 		entries := []pickEntry{{
 			display: "📁 choose a different folder…",
@@ -54,7 +56,7 @@ func pickKey(cfg *config.Config, keyDir *string, vlt *vault.Client) (keyChoice, 
 		}}
 
 		if vlt != nil {
-			units, err := vlt.ListUnits()
+			units, err := vlt.ListUnits(ctx)
 			if err != nil {
 				ui.PrintWarn("vault: " + err.Error())
 			} else {
@@ -139,11 +141,11 @@ func pickKey(cfg *config.Config, keyDir *string, vlt *vault.Client) (keyChoice, 
 			}
 			*keyDir = dir
 		case pickDownload:
-			if err := vaultPullInteractive(vlt, *keyDir); err != nil && !isAbort(err) {
+			if err := vaultPullInteractive(ctx, vlt, *keyDir); err != nil && !isAbort(err) {
 				ui.PrintWarn(err.Error())
 			}
 		case pickVault:
-			path, err := materializeVaultKey(vlt, e.value)
+			path, err := materializeVaultKey(ctx, vlt, e.value, vaultTempDir)
 			if err != nil {
 				ui.PrintWarn(err.Error())
 				continue
@@ -163,6 +165,9 @@ func scanKeys(dir string) ([]string, error) {
 	}
 
 	var keys []string
+	// Error discarded: per-entry errors are already skipped in the callback
+	// below; an unreadable root just yields an empty key list, which the
+	// caller already handles via the "no *.key files found" error.
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries

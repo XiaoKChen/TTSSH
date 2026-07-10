@@ -4,6 +4,7 @@ package main
 // and the `ttssh vault <list|pull|setup>` subcommands.
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,37 +36,47 @@ func connectVault(cfg config.Config) *vault.Client {
 
 // ---- session temp keys ----
 
-// vaultTempDir holds decrypted keys for the current session only. Created
-// lazily, 0700, removed on exit (fatal() also cleans it up).
-var vaultTempDir string
+// Permissions for the session-only decrypted key material: keyDirPerm on the
+// temp directory holding the keys, keyFilePerm on each key file (and on the
+// files 'vault pull' saves permanently).
+const (
+	keyDirPerm  = 0o700
+	keyFilePerm = 0o600
+)
 
-func materializeVaultKey(v *vault.Client, unitID string) (string, error) {
-	key, err := v.FetchKey(unitID)
+// materializeVaultKey fetches and decrypts unitID, writing it to a session
+// temp directory. *tempDir holds that directory's path across calls so the
+// temp dir is created at most once per run; the caller (main) owns it and is
+// responsible for calling cleanupVaultTemp on exit.
+func materializeVaultKey(ctx context.Context, v *vault.Client, unitID string, tempDir *string) (string, error) {
+	key, err := v.FetchKey(ctx, unitID)
 	if err != nil {
 		return "", err
 	}
-	if vaultTempDir == "" {
+	if *tempDir == "" {
 		dir, err := os.MkdirTemp("", "ttssh-vault-")
 		if err != nil {
 			return "", fmt.Errorf("creating session key dir: %w", err)
 		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			os.RemoveAll(dir)
+		if err := os.Chmod(dir, keyDirPerm); err != nil {
+			_ = os.RemoveAll(dir) // best-effort cleanup of a dir we're abandoning
 			return "", err
 		}
-		vaultTempDir = dir
+		*tempDir = dir
 	}
-	path := filepath.Join(vaultTempDir, unitID+".key")
-	if err := os.WriteFile(path, key, 0o600); err != nil {
+	path := filepath.Join(*tempDir, unitID+".key")
+	if err := os.WriteFile(path, key, keyFilePerm); err != nil {
 		return "", fmt.Errorf("writing session key file: %w", err)
 	}
 	return path, nil
 }
 
-func cleanupVaultTemp() {
-	if vaultTempDir != "" {
-		_ = os.RemoveAll(vaultTempDir)
-		vaultTempDir = ""
+// cleanupVaultTemp removes the session temp dir, if one was created, and
+// clears *tempDir. Safe to call even when no key was ever materialized.
+func cleanupVaultTemp(tempDir *string) {
+	if *tempDir != "" {
+		_ = os.RemoveAll(*tempDir) // best-effort cleanup on exit
+		*tempDir = ""
 	}
 }
 
@@ -77,8 +88,8 @@ const vaultRecentPrefix = "vault:"
 
 // vaultPullInteractive multi-selects units and saves them as <unit>.key files
 // into a folder chosen with the folder browser.
-func vaultPullInteractive(v *vault.Client, startDir string) error {
-	units, err := v.ListUnits()
+func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string) error {
+	units, err := v.ListUnits(ctx)
 	if err != nil {
 		return err
 	}
@@ -117,7 +128,7 @@ func vaultPullInteractive(v *vault.Client, startDir string) error {
 		return err
 	}
 
-	saved, err := saveVaultKeys(v, selected, dir, confirmOverwrite)
+	saved, err := saveVaultKeys(ctx, v, selected, dir, confirmOverwrite)
 	if saved > 0 {
 		ui.PrintSuccess(fmt.Sprintf("Saved %d key file(s) to %s", saved, dir))
 	}
@@ -141,7 +152,7 @@ func confirmOverwrite(dest string) (bool, error) {
 // saveVaultKeys fetches, decrypts, and writes each unit to dir as
 // <unit>.key (0600). onConflict decides what happens to existing files;
 // nil means "refuse". Returns how many files were written.
-func saveVaultKeys(v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error)) (int, error) {
+func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error)) (int, error) {
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
 		return 0, fmt.Errorf("destination folder %s does not exist", dir)
@@ -163,12 +174,12 @@ func saveVaultKeys(v *vault.Client, unitIDs []string, dir string, onConflict fun
 				continue
 			}
 		}
-		key, err := v.FetchKey(id)
+		key, err := v.FetchKey(ctx, id)
 		if err != nil {
 			ui.PrintWarn(err.Error())
 			continue
 		}
-		if err := os.WriteFile(dest, key, 0o600); err != nil {
+		if err := os.WriteFile(dest, key, keyFilePerm); err != nil {
 			return saved, fmt.Errorf("writing %s: %w", dest, err)
 		}
 		ui.PrintSuccess("Saved " + dest)
@@ -195,7 +206,7 @@ saved by 'ttssh vault setup'.
 }
 
 // handleVaultCommand runs `ttssh vault <sub>` and returns the process exit code.
-func handleVaultCommand(cfg *config.Config, args []string) int {
+func handleVaultCommand(ctx context.Context, cfg *config.Config, args []string) int {
 	if len(args) == 0 {
 		vaultUsage()
 		return 2
@@ -203,7 +214,7 @@ func handleVaultCommand(cfg *config.Config, args []string) int {
 	sub, rest := args[0], args[1:]
 
 	if sub == "setup" {
-		if err := vaultSetup(cfg); err != nil {
+		if err := vaultSetup(ctx, cfg); err != nil {
 			if isAbort(err) {
 				ui.PrintNote("Cancelled.")
 				return 0
@@ -222,7 +233,7 @@ func handleVaultCommand(cfg *config.Config, args []string) int {
 
 	switch sub {
 	case "list":
-		units, err := v.ListUnits()
+		units, err := v.ListUnits(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ttssh: %v\n", err)
 			return 1
@@ -255,7 +266,7 @@ func handleVaultCommand(cfg *config.Config, args []string) int {
 				return 2
 			}
 		}
-		if err := vaultPull(cfg, v, ids, *out, *force); err != nil {
+		if err := vaultPull(ctx, cfg, v, ids, *out, *force); err != nil {
 			if isAbort(err) {
 				ui.PrintNote("Cancelled.")
 				return 0
@@ -273,15 +284,15 @@ func handleVaultCommand(cfg *config.Config, args []string) int {
 
 // vaultPull is the command-line download: fully non-interactive when both
 // unit ids and -out are given, interactive where information is missing.
-func vaultPull(cfg *config.Config, v *vault.Client, ids []string, out string, force bool) error {
+func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []string, out string, force bool) error {
 	if len(ids) == 0 && out == "" {
-		return vaultPullInteractive(v, config.ResolveKeyDir("", *cfg))
+		return vaultPullInteractive(ctx, v, config.ResolveKeyDir("", *cfg))
 	}
 
 	if len(ids) == 0 {
-		units, err := v.ListUnits()
+		units, err := v.ListUnits(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("listing vault keys: %w", err)
 		}
 		opts := make([]huh.Option[string], 0, len(units))
 		for _, u := range units {
@@ -317,7 +328,7 @@ func vaultPull(cfg *config.Config, v *vault.Client, ids []string, out string, fo
 	if !force {
 		onConflict = nil // refuse, with a hint
 	}
-	saved, err := saveVaultKeys(v, ids, dir, onConflict)
+	saved, err := saveVaultKeys(ctx, v, ids, dir, onConflict)
 	if err != nil {
 		return err
 	}
@@ -331,7 +342,7 @@ func vaultPull(cfg *config.Config, v *vault.Client, ids []string, out string, fo
 // vaultSetup interactively collects and persists vault credentials. Secrets
 // land in config.json in plain text (same trust level as the uploader's
 // .env); prefer environment variables if that is a concern.
-func vaultSetup(cfg *config.Config) error {
+func vaultSetup(ctx context.Context, cfg *config.Config) error {
 	vc := vault.ResolveConfig(*cfg)
 	url, token, masterHex, caCert := vc.URL, vc.Token, vc.MasterKeyHex, vc.CACert
 
@@ -384,11 +395,11 @@ func vaultSetup(cfg *config.Config) error {
 	ui.PrintNote("Testing the connection…")
 	v, err := vault.Open(candidate)
 	if err != nil {
-		return err
+		return fmt.Errorf("connecting to vault: %w", err)
 	}
-	units, err := v.ListUnits()
+	units, err := v.ListUnits(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("listing vault keys: %w", err)
 	}
 	ui.PrintSuccess(fmt.Sprintf("Connected — %d key(s) in the vault.", len(units)))
 
@@ -396,7 +407,10 @@ func vaultSetup(cfg *config.Config) error {
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
-	path, _ := config.Path()
+	path, err := config.Path()
+	if err != nil {
+		path = "(unknown)"
+	}
 	ui.PrintSuccess("Vault settings saved to " + path)
 	ui.PrintWarn("The token and master key are stored there in plain text — protect that file, or use environment variables instead.")
 	return nil

@@ -35,8 +35,11 @@ if [ "${1:-}" = "--no-build" ]; then
         exit 1
     fi
 else
+    ver=$(cd "$repo_root" && git describe --tags --always --dirty 2>/dev/null) || ver=dev
+    [ -n "$ver" ] || ver=dev
+
     tmp_bin=$(mktemp)
-    (cd "$repo_root" && go build -o "$tmp_bin" ./cmd/ttssh)
+    (cd "$repo_root" && go build -ldflags "-X main.version=$ver" -o "$tmp_bin" ./cmd/ttssh)
     source_bin=$tmp_bin
 fi
 
