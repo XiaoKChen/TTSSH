@@ -37,9 +37,11 @@ var (
 			Padding(0, 1)
 )
 
-func PrintBanner(keyDir string, vaultOn bool) {
+// PrintBanner prints ttssh's startup banner showing the version, active key
+// directory, and vault status.
+func PrintBanner(keyDir string, vaultOn bool, version string) {
 	fmt.Println(bannerStyle.Render(
-		titleStyle.Render("⚡ TTSSH") + "  " + subtitleStyle.Render("interactive SSH manager")))
+		titleStyle.Render("⚡ TTSSH") + " " + subtitleStyle.Render(version) + "  " + subtitleStyle.Render("interactive SSH manager")))
 	fmt.Println(subtitleStyle.Render("  📁 keys: " + keyDir))
 	if vaultOn {
 		fmt.Println(subtitleStyle.Render("  ☁ vault: connected"))
@@ -54,21 +56,25 @@ func PrintSessionCard(target, key string) {
 			subtitleStyle.Render("🔑 "+key)))
 }
 
+// PrintSuccess prints a success message.
 func PrintSuccess(msg string) {
 	fmt.Println(successStyle.Render("✓ " + msg))
 	fmt.Println()
 }
 
+// PrintWarn prints a warning message.
 func PrintWarn(msg string) {
 	fmt.Println(warnStyle.Render("! " + msg))
 	fmt.Println()
 }
 
+// PrintNote prints an informational note.
 func PrintNote(msg string) {
 	fmt.Println(subtitleStyle.Render(msg))
 	fmt.Println()
 }
 
+// PrintCommand prints the external command about to be run.
 func PrintCommand(name string, args []string) {
 	fmt.Println(cmdStyle.Render("> " + name + " " + strings.Join(args, " ")))
 	fmt.Println()

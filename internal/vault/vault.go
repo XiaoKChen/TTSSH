@@ -16,6 +16,7 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -177,9 +178,33 @@ type pipelineResponse struct {
 	} `json:"results"`
 }
 
+// isCertError reports whether err (as returned by http.Client.Do) stems from
+// a failed TLS certificate verification, so execute can offer the DB_CA_CERT
+// hint instead of a generic connectivity message.
+func isCertError(err error) bool {
+	var certVerifyErr *tls.CertificateVerificationError
+	if errors.As(err, &certVerifyErr) {
+		return true
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuth) {
+		return true
+	}
+	var certInvalid x509.CertificateInvalidError
+	if errors.As(err, &certInvalid) {
+		return true
+	}
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		return true
+	}
+	return false
+}
+
 // execute runs one parameterized statement and returns rows as column→value
-// maps. Only text parameters are needed by this client.
-func (v *Client) execute(sql string, params ...string) ([]map[string]string, error) {
+// maps. Only text parameters are needed by this client. ctx bounds the HTTP
+// request and is never stored.
+func (v *Client) execute(ctx context.Context, sql string, params ...string) ([]map[string]string, error) {
 	args := make([]map[string]string, len(params))
 	for i, p := range params {
 		args[i] = map[string]string{"type": "text", "value": p}
@@ -194,7 +219,7 @@ func (v *Client) execute(sql string, params ...string) ([]map[string]string, err
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, v.endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -203,8 +228,7 @@ func (v *Client) execute(sql string, params ...string) ([]map[string]string, err
 
 	resp, err := v.client.Do(req)
 	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "certificate") || strings.Contains(msg, "x509") {
+		if isCertError(err) {
 			return nil, fmt.Errorf("vault TLS certificate not trusted — if the server uses a private CA, set DB_CA_CERT to its root certificate (%v)", err)
 		}
 		return nil, fmt.Errorf("cannot reach vault database: %v", err)
@@ -266,10 +290,11 @@ func decodeCell(typ string, raw json.RawMessage) string {
 	return string(raw)
 }
 
-// ListUnits returns all stored units, active first, then by unit id.
-func (v *Client) ListUnits() ([]Unit, error) {
-	rows, err := v.execute(
-		"SELECT unit_id, fingerprint, created_at, revoked_at FROM unit_keys " +
+// ListUnits returns all stored units, active first, then by unit id. ctx
+// bounds the underlying HTTP request.
+func (v *Client) ListUnits(ctx context.Context) ([]Unit, error) {
+	rows, err := v.execute(ctx,
+		"SELECT unit_id, fingerprint, created_at, revoked_at FROM unit_keys "+
 			"ORDER BY (revoked_at IS NOT NULL), unit_id")
 	if err != nil {
 		return nil, err
@@ -286,12 +311,13 @@ func (v *Client) ListUnits() ([]Unit, error) {
 	return units, nil
 }
 
-// FetchKey downloads and decrypts one unit's private key.
-func (v *Client) FetchKey(unitID string) ([]byte, error) {
+// FetchKey downloads and decrypts one unit's private key. ctx bounds the
+// underlying HTTP request.
+func (v *Client) FetchKey(ctx context.Context, unitID string) ([]byte, error) {
 	if !ValidUnitID(unitID) {
 		return nil, fmt.Errorf("invalid unit id %q", unitID)
 	}
-	rows, err := v.execute(
+	rows, err := v.execute(ctx,
 		"SELECT ciphertext, iv, auth_tag, key_version FROM unit_keys WHERE unit_id = ?", unitID)
 	if err != nil {
 		return nil, err

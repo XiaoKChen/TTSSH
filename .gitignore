@@ -12,3 +12,20 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# From project template
+bin/
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.html
+go.work
+go.work.sum
+.env.*
+project-table/
+PROJECT.md
+.claude/settings.local.json
+.claude/memory/

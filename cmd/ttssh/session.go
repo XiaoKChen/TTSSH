@@ -4,6 +4,7 @@ package main
 // and the SSH / copy-to / copy-from action loop against it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -42,10 +43,11 @@ func (s session) recentKey() string {
 
 // chooseSession offers recent connections (if any) or builds a new one.
 // keyDir may be updated if the user switches folders in the key picker.
-func chooseSession(cfg *config.Config, keyDir *string, vlt *vault.Client) (session, error) {
+// vaultTempDir is threaded through to materializeVaultKey (see vaultcmd.go).
+func chooseSession(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (session, error) {
 	for {
 		if len(cfg.Recents) == 0 {
-			return newSession(cfg, keyDir, vlt)
+			return newSession(ctx, cfg, keyDir, vlt, vaultTempDir)
 		}
 
 		opts := make([]huh.Option[int], 0, len(cfg.Recents)+1)
@@ -65,7 +67,7 @@ func chooseSession(cfg *config.Config, keyDir *string, vlt *vault.Client) (sessi
 			return session{}, err
 		}
 		if idx == -1 {
-			return newSession(cfg, keyDir, vlt)
+			return newSession(ctx, cfg, keyDir, vlt, vaultTempDir)
 		}
 
 		r := cfg.Recents[idx]
@@ -74,7 +76,7 @@ func chooseSession(cfg *config.Config, keyDir *string, vlt *vault.Client) (sessi
 				ui.PrintWarn("This entry uses a vault key, but the vault is not configured (ttssh vault setup).")
 				continue
 			}
-			path, err := materializeVaultKey(vlt, unitID)
+			path, err := materializeVaultKey(ctx, vlt, unitID, vaultTempDir)
 			if err != nil {
 				ui.PrintWarn(err.Error())
 				if errors.Is(err, vault.ErrUnitNotFound) {
@@ -94,8 +96,8 @@ func chooseSession(cfg *config.Config, keyDir *string, vlt *vault.Client) (sessi
 }
 
 // newSession fuzzy-picks a key then asks for username and host.
-func newSession(cfg *config.Config, keyDir *string, vlt *vault.Client) (session, error) {
-	key, err := pickKey(cfg, keyDir, vlt)
+func newSession(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (session, error) {
+	key, err := pickKey(ctx, cfg, keyDir, vlt, vaultTempDir)
 	if err != nil {
 		return session{}, err
 	}
@@ -141,7 +143,7 @@ const (
 
 // actionLoop runs actions against sess until the user quits or switches
 // connection. Returns true when the user wants to pick another connection.
-func actionLoop(sess session) (bool, error) {
+func actionLoop(ctx context.Context, sess session) (bool, error) {
 	for {
 		fmt.Println()
 		ui.PrintSessionCard(sess.target(), sess.Label)
@@ -167,11 +169,11 @@ func actionLoop(sess session) (bool, error) {
 		case actionQuit:
 			return false, nil
 		case actionSSH:
-			err = runInteractive("ssh", "-i", sess.Key, sess.target())
+			err = runInteractive(ctx, "ssh", "-i", sess.Key, sess.target())
 		case actionCopyTo:
-			err = copyToRemote(sess)
+			err = copyToRemote(ctx, sess)
 		case actionCopyFrom:
-			err = copyFromRemote(sess)
+			err = copyFromRemote(ctx, sess)
 		}
 
 		switch {
@@ -186,7 +188,7 @@ func actionLoop(sess session) (bool, error) {
 }
 
 // copyToRemote fuzzy-selects a local file and scp's it to the remote host.
-func copyToRemote(sess session) error {
+func copyToRemote(ctx context.Context, sess session) error {
 	startDir, err := ui.InputLine("Local directory to search", ".", false)
 	if err != nil {
 		return err
@@ -212,7 +214,7 @@ func copyToRemote(sess session) error {
 	if err != nil {
 		return err
 	}
-	if err := runInteractive("scp", "-i", sess.Key, local, sess.target()+":"+dest); err != nil {
+	if err := runInteractive(ctx, "scp", "-i", sess.Key, local, sess.target()+":"+dest); err != nil {
 		return err
 	}
 	ui.PrintSuccess("Copied " + filepath.Base(local) + " to " + sess.target() + ":" + dest)
@@ -220,13 +222,13 @@ func copyToRemote(sess session) error {
 }
 
 // copyFromRemote lists remote files over ssh, fuzzy-selects one, and scp's it back.
-func copyFromRemote(sess session) error {
+func copyFromRemote(ctx context.Context, sess session) error {
 	remoteDir, err := ui.InputLine("Remote directory to search", "~", false)
 	if err != nil {
 		return err
 	}
 
-	remote, err := pickRemoteFile(sess, remoteDir)
+	remote, err := pickRemoteFile(ctx, sess, remoteDir)
 	if err != nil {
 		return err
 	}
@@ -235,7 +237,7 @@ func copyFromRemote(sess session) error {
 	if err != nil {
 		return err
 	}
-	if err := runInteractive("scp", "-i", sess.Key, sess.target()+":"+remote, config.ExpandHome(dest)); err != nil {
+	if err := runInteractive(ctx, "scp", "-i", sess.Key, sess.target()+":"+remote, config.ExpandHome(dest)); err != nil {
 		return err
 	}
 	ui.PrintSuccess("Copied " + sess.target() + ":" + remote + " to " + dest)
@@ -244,9 +246,9 @@ func copyFromRemote(sess session) error {
 
 // pickRemoteFile runs find on the remote host and fuzzy-selects from the result.
 // If remote listing fails (e.g. no find command), it falls back to manual entry.
-func pickRemoteFile(sess session, remoteDir string) (string, error) {
+func pickRemoteFile(ctx context.Context, sess session, remoteDir string) (string, error) {
 	ui.PrintNote("Listing remote files...")
-	cmd := exec.Command("ssh", "-i", sess.Key, sess.target(),
+	cmd := exec.CommandContext(ctx, "ssh", "-i", sess.Key, sess.target(),
 		fmt.Sprintf("find %s -maxdepth 6 -type f 2>/dev/null", remoteDir))
 	out, err := cmd.Output()
 	files := splitLines(string(out))
@@ -295,9 +297,9 @@ func listLocalFiles(dir string) ([]string, error) {
 // interactive ssh sessions and scp progress output). A non-zero exit from
 // the command is reported but not treated as a ttssh error, so the action
 // menu comes back afterwards.
-func runInteractive(name string, args ...string) error {
+func runInteractive(ctx context.Context, name string, args ...string) error {
 	ui.PrintCommand(name, args)
-	cmd := exec.Command(name, args...)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
