@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          ldflags="-X main.version=${{ github.ref_name }}"
+          GOOS=linux   GOARCH=amd64 go build -ldflags "$ldflags" -o dist/ttssh-linux-amd64       ./cmd/ttssh
+          GOOS=darwin  GOARCH=amd64 go build -ldflags "$ldflags" -o dist/ttssh-darwin-amd64      ./cmd/ttssh
+          GOOS=darwin  GOARCH=arm64 go build -ldflags "$ldflags" -o dist/ttssh-darwin-arm64      ./cmd/ttssh
+          GOOS=windows GOARCH=amd64 go build -ldflags "$ldflags" -o dist/ttssh-windows-amd64.exe ./cmd/ttssh
+      - name: Create Gitea Release
+        uses: https://gitea.com/actions/gitea-release-action@v1
+        with:
+          files: |-
+            dist/ttssh-*
