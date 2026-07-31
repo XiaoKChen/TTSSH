@@ -136,8 +136,14 @@ GOOS=windows GOARCH=amd64 go build -o ttssh.exe ./cmd/ttssh
 ```
 
 Prebuilt binaries for Linux (amd64), macOS (arm64/amd64), and Windows (amd64)
-land in `dist/` — everything, including the fuzzy finder and the vault client,
-is statically compiled in; the only runtime requirement is `ssh`/`scp` on PATH.
+are attached to each [GitHub release](https://github.com/XiaoKChen/TTSSH/releases)
+(built automatically when a `v*` tag is pushed; local builds land in `dist/`) —
+everything, including the fuzzy finder and the vault client, is statically
+compiled in; the only runtime requirement is `ssh`/`scp` on PATH.
+
+The binary reports its build version in the banner and in `ttssh config`; it is
+injected at build time, so release and install-script builds are stamped with
+the git tag automatically.
 
 ## Installing (run `ttssh` from anywhere)
 
