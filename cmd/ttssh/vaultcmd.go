@@ -112,7 +112,7 @@ func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string)
 		Description("Space toggles · a toggles all · Enter confirms").
 		Options(opts...).
 		Value(&selected).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(ui.HuhTheme()).
 		Run()
 	if err != nil {
 		return err
@@ -144,7 +144,7 @@ func confirmOverwrite(dest string) (bool, error) {
 		Affirmative("Overwrite").
 		Negative("Skip").
 		Value(&ok).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(ui.HuhTheme()).
 		Run()
 	return ok, err
 }
@@ -306,7 +306,7 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 			Title("Download which keys?").
 			Options(opts...).
 			Value(&ids).
-			WithTheme(huh.ThemeCharm()).
+			WithTheme(ui.HuhTheme()).
 			Run(); err != nil {
 			return err
 		}
@@ -380,7 +380,7 @@ func vaultSetup(ctx context.Context, cfg *config.Config) error {
 		huh.NewInput().Title("Private CA certificate path (optional)").
 			Description("Leave empty unless the server uses a private CA").
 			Value(&caCert),
-	)).WithTheme(huh.ThemeCharm())
+	)).WithTheme(ui.HuhTheme())
 	if err := form.Run(); err != nil {
 		return err
 	}

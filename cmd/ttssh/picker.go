@@ -202,7 +202,7 @@ func changeKeyDir(cfg *config.Config, current string) (string, error) {
 		Affirmative("Save").
 		Negative("Just this session").
 		Value(&save).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(ui.HuhTheme()).
 		Run()
 	if err == nil && save {
 		cfg.KeyDir = dir

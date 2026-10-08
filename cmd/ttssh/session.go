@@ -120,7 +120,7 @@ func newSession(ctx context.Context, cfg *config.Config, keyDir *string, vlt *va
 			Validate(noSpaces("username")).Value(&user),
 		huh.NewInput().Title("Host (IP or hostname)").Placeholder("192.168.1.10").
 			Validate(noSpaces("host")).Value(&host),
-	)).WithTheme(huh.ThemeCharm())
+	)).WithTheme(ui.HuhTheme())
 	if err := form.Run(); err != nil {
 		return session{}, err
 	}

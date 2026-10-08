@@ -14,26 +14,14 @@ import (
 )
 
 var (
-	accent = lipgloss.Color("212")
-	dim    = lipgloss.Color("241")
-	green  = lipgloss.Color("42")
-	red    = lipgloss.Color("196")
-
 	bannerStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(accent).
+			BorderForeground(Accent).
 			Padding(0, 2)
-
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(accent)
-	subtitleStyle = lipgloss.NewStyle().Foreground(dim)
-	successStyle  = lipgloss.NewStyle().Foreground(green).Bold(true)
-	warnStyle     = lipgloss.NewStyle().Foreground(red)
-	targetStyle   = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	cmdStyle      = lipgloss.NewStyle().Foreground(dim)
 
 	cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(dim).
+			BorderForeground(Border).
 			Padding(0, 1)
 )
 
@@ -41,10 +29,10 @@ var (
 // directory, and vault status.
 func PrintBanner(keyDir string, vaultOn bool, version string) {
 	fmt.Println(bannerStyle.Render(
-		titleStyle.Render("⚡ TTSSH") + " " + subtitleStyle.Render(version) + "  " + subtitleStyle.Render("interactive SSH manager")))
-	fmt.Println(subtitleStyle.Render("  📁 keys: " + keyDir))
+		TitleStyle.Render("⚡ TTSSH") + " " + MutedStyle.Render(version) + "  " + MutedStyle.Render("interactive SSH manager")))
+	fmt.Println(MutedStyle.Render("  📁 keys: " + keyDir))
 	if vaultOn {
-		fmt.Println(subtitleStyle.Render("  ☁ vault: connected"))
+		fmt.Println(MutedStyle.Render("  ☁ vault: connected"))
 	}
 	fmt.Println()
 }
@@ -52,31 +40,31 @@ func PrintBanner(keyDir string, vaultOn bool, version string) {
 // PrintSessionCard shows the active connection above the action menu.
 func PrintSessionCard(target, key string) {
 	fmt.Println(cardStyle.Render(
-		targetStyle.Render("🔗 "+target) + "\n" +
-			subtitleStyle.Render("🔑 "+key)))
+		TitleStyle.Render("🔗 "+target) + "\n" +
+			MutedStyle.Render("🔑 "+key)))
 }
 
 // PrintSuccess prints a success message.
 func PrintSuccess(msg string) {
-	fmt.Println(successStyle.Render("✓ " + msg))
+	fmt.Println(SuccessStyle.Render("✓ " + msg))
 	fmt.Println()
 }
 
 // PrintWarn prints a warning message.
 func PrintWarn(msg string) {
-	fmt.Println(warnStyle.Render("! " + msg))
+	fmt.Println(WarnStyle.Render("! " + msg))
 	fmt.Println()
 }
 
 // PrintNote prints an informational note.
 func PrintNote(msg string) {
-	fmt.Println(subtitleStyle.Render(msg))
+	fmt.Println(MutedStyle.Render(msg))
 	fmt.Println()
 }
 
 // PrintCommand prints the external command about to be run.
 func PrintCommand(name string, args []string) {
-	fmt.Println(cmdStyle.Render("> " + name + " " + strings.Join(args, " ")))
+	fmt.Println(MutedStyle.Render("> " + name + " " + strings.Join(args, " ")))
 	fmt.Println()
 }
 
@@ -87,7 +75,7 @@ func SelectOne[T comparable](title string, options []huh.Option[T]) (T, error) {
 		Title(title).
 		Options(options...).
 		Value(&choice).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(HuhTheme()).
 		Run()
 	return choice, err
 }
@@ -108,7 +96,7 @@ func InputLine(title, def string, required bool) (string, error) {
 	if def != "" {
 		field = field.Placeholder(def)
 	}
-	if err := field.WithTheme(huh.ThemeCharm()).Run(); err != nil {
+	if err := field.WithTheme(HuhTheme()).Run(); err != nil {
 		return "", err
 	}
 	val = strings.TrimSpace(val)
@@ -138,7 +126,7 @@ func InputDir(title, def string) (string, error) {
 			return nil
 		}).
 		Value(&val).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(HuhTheme()).
 		Run()
 	if err != nil {
 		return "", err
