@@ -1,160 +1,271 @@
 package main
 
-// The key picker and folder browser: fuzzy-select an SSH key from vault
-// entries and local *.key files, with folder switching built in.
+// The key picker and folder browser screens: choose an SSH key from vault
+// units and local *.key files, switch the key folder, and download vault
+// keys into a folder.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
-	"github.com/ktr0731/go-fuzzyfinder"
 
 	"ttssh/internal/config"
 	"ttssh/internal/ui"
 	"ttssh/internal/vault"
 )
 
-// keyChoice is the outcome of the key picker.
-type keyChoice struct {
-	Path    string // file passed to ssh -i (session temp file for vault keys)
-	Label   string // display label
-	VaultID string // vault unit id, empty for local files
+// keyPicker is the key picker's state beyond its list.
+type keyPicker struct {
+	units   []vault.Unit
+	loading bool // vault units are still being fetched
 }
 
-// pickEntry is one row of the key picker list.
-type pickEntry struct {
-	display string
-	preview string
-	kind    int    // pickBrowse | pickDownload | pickVault | pickLocal
-	value   string // vault unit id or local file path
-}
+// openKeyPicker starts the new-connection flow: pick a key, then the target.
+// Local keys show at once; vault units are loaded in the background.
+func (m *model) openKeyPicker() tea.Cmd {
+	p := &keyPicker{}
+	s := &screen{
+		kind:    screenKeys,
+		list:    newList("Keys", "key", "keys", nil),
+		actions: []key.Binding{m.keys.Select, m.keys.Folder, m.keys.Pull},
+		details: keyDetails,
+	}
+	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
+		switch {
+		case key.Matches(msg, m.keys.Select):
+			if it := s.selected(); it.kind != itemNone {
+				return m.askTarget(it), true
+			}
+			return nil, true
+		case key.Matches(msg, m.keys.Folder):
+			return m.changeKeyDir(s, p), true
+		case key.Matches(msg, m.keys.Pull):
+			return m.pullVaultKeys(s, p), true
+		}
+		return nil, false
+	}
 
-const (
-	pickBrowse = iota
-	pickDownload
-	pickVault
-	pickLocal
-)
-
-// pickKey fuzzy-selects an SSH key from the vault (when configured) and from
-// *.key files under keyDir. The top entries switch folders or download vault
-// keys; keyDir is updated in place when the user switches folders. vaultTempDir
-// is threaded through to materializeVaultKey (see vaultcmd.go).
-func pickKey(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (keyChoice, error) {
-	for {
-		entries := []pickEntry{{
-			display: "📁 choose a different folder…",
-			kind:    pickBrowse,
-			preview: "Search *.key files in another folder,\nwith the option to save it as the default.",
-		}}
-
-		if vlt != nil {
+	cmds := []tea.Cmd{m.push(s), m.reloadKeys(s, p)}
+	if m.vlt != nil {
+		p.loading = true
+		vlt := m.vlt
+		cmds = append(cmds, m.startOp("Loading vault keys…", false, func(ctx context.Context) func(*model) tea.Cmd {
 			units, err := vlt.ListUnits(ctx)
-			if err != nil {
-				ui.PrintWarn("vault: " + err.Error())
-			} else {
-				entries = append(entries, pickEntry{
-					display: "⬇ download vault keys to a folder…",
-					kind:    pickDownload,
-					preview: "Save keys from the vault as <unit>.key files\nin a folder of your choice.",
-				})
-				for _, u := range units {
-					display := "☁ " + u.UnitID
-					status := "active"
-					if u.Revoked() {
-						display += "  (revoked)"
-						status = "revoked"
-					}
-					entries = append(entries, pickEntry{
-						display: display,
-						kind:    pickVault,
-						value:   u.UnitID,
-						preview: fmt.Sprintf("vault key · decrypted only for this session\n\nfingerprint  %s\ncreated      %s\nstatus       %s",
-							u.Fingerprint, u.CreatedAt, status),
-					})
-				}
-			}
-		}
-
-		keys, scanErr := scanKeys(*keyDir)
-		for _, k := range keys {
-			display := k
-			if rel, err := filepath.Rel(*keyDir, k); err == nil {
-				display = rel
-			}
-			entries = append(entries, pickEntry{display: display, kind: pickLocal, value: k})
-		}
-		if scanErr != nil {
-			// Without vault keys this is a dead end — jump to the folder
-			// browser like before. With vault keys, just mention it.
-			if len(entries) <= 1 {
-				ui.PrintWarn(scanErr.Error())
-				dir, err := changeKeyDir(cfg, *keyDir)
+			return func(m *model) tea.Cmd {
+				p.loading = false
 				if err != nil {
-					return keyChoice{}, err
+					return m.setStatus(statusWarn, "vault: "+err.Error())
 				}
-				*keyDir = dir
-				continue
+				p.units = units
+				return m.reloadKeys(s, p)
 			}
-			ui.PrintNote("(" + scanErr.Error() + ")")
-		}
+		}))
+	}
+	return tea.Batch(cmds...)
+}
 
-		idx, err := fuzzyfinder.Find(entries, func(i int) string {
-			return entries[i].display
-		},
-			fuzzyfinder.WithHeader("Select SSH key · "+*keyDir),
-			fuzzyfinder.WithPreviewWindow(func(i, w, h int) string {
-				if i < 0 {
-					return ""
-				}
-				e := entries[i]
-				if e.kind != pickLocal {
-					return e.preview
-				}
-				info, err := os.Stat(e.value)
-				if err != nil {
-					return e.value
-				}
-				return fmt.Sprintf("%s\n\nsize      %d bytes\nmodified  %s",
-					e.value, info.Size(), info.ModTime().Format("2006-01-02 15:04"))
-			}),
-		)
-		if err != nil {
-			return keyChoice{}, err
+// reloadKeys lists vault units first, then *.key files under m.keyDir.
+func (m *model) reloadKeys(s *screen, p *keyPicker) tea.Cmd {
+	var items []item
+	for _, u := range p.units {
+		label := "☁ " + u.UnitID
+		if u.Revoked() {
+			label += "  (revoked)"
 		}
+		items = append(items, item{kind: itemVaultKey, label: label, value: u.UnitID, unit: u})
+	}
+	keys, scanErr := scanKeys(m.keyDir)
+	for _, k := range keys {
+		label := k
+		if rel, err := filepath.Rel(m.keyDir, k); err == nil {
+			label = rel
+		}
+		items = append(items, item{kind: itemLocalKey, label: label, value: k})
+	}
 
-		switch e := entries[idx]; e.kind {
-		case pickBrowse:
-			dir, err := changeKeyDir(cfg, *keyDir)
-			if err != nil {
-				if isAbort(err) {
-					continue // back to the key list
-				}
-				return keyChoice{}, err
-			}
-			*keyDir = dir
-		case pickDownload:
-			if err := vaultPullInteractive(ctx, vlt, *keyDir); err != nil && !isAbort(err) {
-				ui.PrintWarn(err.Error())
-			}
-		case pickVault:
-			path, err := materializeVaultKey(ctx, vlt, e.value, vaultTempDir)
-			if err != nil {
-				ui.PrintWarn(err.Error())
-				continue
-			}
-			return keyChoice{Path: path, Label: vaultLabel(e.value), VaultID: e.value}, nil
-		case pickLocal:
-			return keyChoice{Path: e.value, Label: e.value}, nil
+	s.list.Title = "Keys · " + m.keyDir
+	s.empty = ""
+	cmds := []tea.Cmd{s.list.SetItems(toListItems(items))}
+	if scanErr != nil {
+		s.empty = scanErr.Error() + ".\n\nPress f to choose another folder."
+		if len(items) > 0 {
+			cmds = append(cmds, m.setStatus(statusInfo, scanErr.Error()))
 		}
 	}
+	return tea.Batch(cmds...)
+}
+
+func keyDetails(it item) string {
+	if it.kind == itemLocalKey {
+		return localFileDetails(it)
+	}
+	u := it.unit
+	state := "active"
+	if u.Revoked() {
+		state = "revoked"
+	}
+	return "☁ " + u.UnitID + "\n" + ui.MutedStyle.Render("vault key · decrypted only for this session") + "\n\n" +
+		ui.MutedStyle.Render("fingerprint  ") + u.Fingerprint + "\n" +
+		ui.MutedStyle.Render("created      ") + u.CreatedAt + "\n" +
+		ui.MutedStyle.Render("status       ") + state
+}
+
+// askTarget collects the user and host for the chosen key, records the new
+// connection in the recents, and selects it on the dashboard.
+func (m *model) askTarget(keyItem item) tea.Cmd {
+	keyRef, keyLabel := keyItem.value, keyItem.value
+	if keyItem.kind == itemVaultKey {
+		keyRef, keyLabel = vaultRecentPrefix+keyItem.value, vaultLabel(keyItem.value)
+	}
+	var user, host string
+	form := newForm(huh.NewGroup(
+		huh.NewInput().Title("Username").Placeholder("root").
+			Validate(noSpaces("username")).Value(&user),
+		huh.NewInput().Title("Host (IP or hostname)").Placeholder("192.168.1.10").
+			Validate(noSpaces("host")).Value(&host),
+	).Title("New connection").Description("Key: " + keyLabel))
+	return m.push(formScreen(form, func(m *model) tea.Cmd {
+		r := config.Recent{User: strings.TrimSpace(user), Host: strings.TrimSpace(host), Key: keyRef}
+		m.popTo(1)
+		m.cfg.AddRecent(r)
+		return tea.Batch(m.refreshDashboard(0),
+			m.setStatus(statusSuccess, "Added "+r.User+"@"+r.Host+" — press enter to connect."))
+	}))
+}
+
+func noSpaces(what string) func(string) error {
+	return func(s string) error {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return fmt.Errorf("%s is required", what)
+		}
+		if strings.ContainsAny(s, " \t") {
+			return fmt.Errorf("%s must not contain spaces", what)
+		}
+		return nil
+	}
+}
+
+// changeKeyDir browses to another key folder and offers to save it as the
+// default; backing out of that question keeps it for this session only.
+func (m *model) changeKeyDir(s *screen, p *keyPicker) tea.Cmd {
+	return m.push(m.folderBrowser(m.keyDir, func(m *model, dir string) tea.Cmd {
+		if dir == m.keyDir {
+			return nil
+		}
+		m.keyDir = dir
+		save := false
+		confirm := newForm(huh.NewGroup(huh.NewConfirm().
+			Title("Save as default key folder?").
+			Description(dir).
+			Affirmative("Save").
+			Negative("Just this session").
+			Value(&save)))
+		return tea.Batch(m.reloadKeys(s, p), m.push(formScreen(confirm, func(m *model) tea.Cmd {
+			if !save {
+				return m.setStatus(statusInfo, "Using "+dir+" for this session.")
+			}
+			m.cfg.KeyDir = dir
+			if err := m.cfg.Save(); err != nil {
+				return m.setStatus(statusWarn, "Could not save config: "+err.Error())
+			}
+			return m.setStatus(statusSuccess, "Default key folder saved.")
+		})))
+	}))
+}
+
+// pullVaultKeys multi-selects vault units, browses to a folder, confirms
+// overwrites one by one, then downloads the keys in the background.
+func (m *model) pullVaultKeys(s *screen, p *keyPicker) tea.Cmd {
+	switch {
+	case p.loading:
+		return m.setStatus(statusInfo, "Vault keys are still loading…")
+	case len(p.units) == 0:
+		return m.setStatus(statusWarn, "The vault has no keys.")
+	}
+	var selected []string
+	form := newForm(huh.NewGroup(huh.NewMultiSelect[string]().
+		Title("Download which keys?").
+		Description("space toggles · ctrl+a toggles all · enter confirms").
+		Options(unitOptions(p.units)...).
+		Value(&selected)))
+	return m.push(formScreen(form, func(m *model) tea.Cmd {
+		if len(selected) == 0 {
+			return m.setStatus(statusInfo, "Nothing selected.")
+		}
+		return m.push(m.folderBrowser(m.keyDir, func(m *model, dir string) tea.Cmd {
+			return m.confirmOverwrites(dir, selected, func(m *model, ids []string) tea.Cmd {
+				return m.saveKeys(s, p, dir, ids)
+			})
+		}))
+	}))
+}
+
+// confirmOverwrites asks about each id whose file already exists in dir,
+// then calls done with the ids to write. Esc on a question drops the batch.
+func (m *model) confirmOverwrites(dir string, ids []string, done func(m *model, ids []string) tea.Cmd) tea.Cmd {
+	var ask func(m *model, next int, keep []string) tea.Cmd
+	ask = func(m *model, next int, keep []string) tea.Cmd {
+		for ; next < len(ids); next++ {
+			id, dest := ids[next], filepath.Join(dir, ids[next]+keyExt)
+			if _, err := os.Stat(dest); err != nil {
+				keep = append(keep, id)
+				continue
+			}
+			overwrite, after := false, next+1
+			return m.push(formScreen(newForm(huh.NewGroup(overwriteConfirm(dest, &overwrite))), func(m *model) tea.Cmd {
+				if overwrite {
+					return ask(m, after, append(slices.Clone(keep), id))
+				}
+				return ask(m, after, keep)
+			}))
+		}
+		if len(keep) == 0 {
+			return m.setStatus(statusInfo, "Nothing to download.")
+		}
+		return done(m, keep)
+	}
+	return ask(m, 0, nil)
+}
+
+// saveKeys downloads ids into dir via saveVaultKeys; every conflict was
+// already confirmed, so existing files are overwritten.
+func (m *model) saveKeys(s *screen, p *keyPicker, dir string, ids []string) tea.Cmd {
+	vlt := m.vlt
+	label := fmt.Sprintf("Downloading %d key(s) to %s…", len(ids), dir)
+	return m.startOp(label, true, func(ctx context.Context) func(*model) tea.Cmd {
+		var problems []string
+		notify := saveNotifier{
+			saved:   func(string) {},
+			skipped: func(msg string) { problems = append(problems, msg) },
+			failed:  func(msg string) { problems = append(problems, msg) },
+		}
+		overwrite := func(string) (bool, error) { return true, nil }
+		saved, err := saveVaultKeys(ctx, vlt, ids, dir, overwrite, notify)
+		return func(m *model) tea.Cmd {
+			reload := m.reloadKeys(s, p) // dir may be the key folder
+			switch {
+			case err != nil:
+				return tea.Batch(reload, m.setStatus(statusError, err.Error()))
+			case len(problems) > 0:
+				return tea.Batch(reload, m.setStatus(statusWarn,
+					fmt.Sprintf("Saved %d of %d key file(s) to %s: %s", saved, len(ids), dir, problems[0])))
+			default:
+				return tea.Batch(reload, m.setStatus(statusSuccess, fmt.Sprintf("Saved %d key file(s) to %s", saved, dir)))
+			}
+		}
+	})
 }
 
 // scanKeys collects *.key files under dir.
@@ -183,109 +294,135 @@ func scanKeys(dir string) ([]string, error) {
 	return keys, nil
 }
 
-// changeKeyDir opens the folder browser and offers to persist the picked
-// folder as the default. Backing out of the save prompt keeps the folder for
-// this session without saving.
-func changeKeyDir(cfg *config.Config, current string) (string, error) {
-	dir, err := browseDir(current)
-	if err != nil {
-		return "", err
-	}
-	if dir == current {
-		return dir, nil
-	}
+// ---- folder browser ----
 
-	save := false
-	err = huh.NewConfirm().
-		Title("Save as default key folder?").
-		Description(dir).
-		Affirmative("Save").
-		Negative("Just this session").
-		Value(&save).
-		WithTheme(ui.HuhTheme()).
-		Run()
-	if err == nil && save {
-		cfg.KeyDir = dir
-		if err := cfg.Save(); err != nil {
-			ui.PrintWarn("Could not save config: " + err.Error())
-		} else {
-			ui.PrintSuccess("Default key folder saved.")
-		}
+// errBrowseCancelled reports that the folder browser was left without
+// choosing a folder.
+var errBrowseCancelled = errors.New("folder selection cancelled")
+
+// browseDir runs the folder browser as its own small program (for the vault
+// pull subcommand) and returns the accepted folder.
+func browseDir(ctx context.Context, start string) (string, error) {
+	m := newModel(ctx, nil, nil, nil, "", "")
+	var chosen string
+	s := m.folderBrowser(start, func(m *model, dir string) tea.Cmd {
+		chosen = dir
+		return m.quit()
+	})
+	s.onBack = func(m *model) tea.Cmd { return m.quit() }
+	s.actions = append(s.actions, m.keys.Cancel)
+	m.startup = m.push(s)
+	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+		return "", fmt.Errorf("folder browser: %w", err)
 	}
-	return dir, nil
+	if chosen == "" {
+		return "", errBrowseCancelled
+	}
+	return chosen, nil
 }
 
-// browseDir is a fuzzy-searchable folder browser. Each screen lists the
-// current folder's subfolders (type to filter) plus entries to accept the
-// current folder, go up, or type a path manually. It returns the accepted
-// folder; Esc aborts the browse.
-func browseDir(start string) (string, error) {
-	dir := start
+// folderBrowser lists the subfolders of the current folder. choose runs
+// after the browser left the stack.
+func (m *model) folderBrowser(start string, choose func(m *model, dir string) tea.Cmd) *screen {
+	dir, atDrives := start, false
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		dir = "."
 		if home, err := os.UserHomeDir(); err == nil {
 			dir = home
-		} else {
-			dir = "."
 		}
 	}
 
-	for {
+	s := &screen{
+		kind:    screenFolders,
+		list:    newList("", "folder", "folders", nil),
+		actions: []key.Binding{m.keys.Open, m.keys.Parent, m.keys.UseDir, m.keys.TypePath},
+		details: func(it item) string { return dirPreview(it.value) },
+	}
+	// show lists dir's subfolders, selecting the one named selectName.
+	show := func(selectName string) tea.Cmd {
+		atDrives = false
+		s.list.Title = "Folders · " + dir
+		s.empty = "No subfolders here.\n\nPress space to use this folder, or ← to go up."
 		subs := listSubdirs(dir)
-		items := []string{"✔ use this folder", "⬆ go up (..)", "✏ type a path…"}
-		items = append(items, subs...)
-
-		idx, err := fuzzyfinder.Find(items, func(i int) string {
-			if i < 3 {
-				return items[i]
-			}
-			return "📁 " + items[i]
-		},
-			fuzzyfinder.WithHeader("Browse folders · "+dir),
-			fuzzyfinder.WithPreviewWindow(func(i, w, h int) string {
-				switch {
-				case i < 0:
-					return ""
-				case i == 0:
-					return dirPreview(dir)
-				case i == 1:
-					return dirPreview(filepath.Dir(dir))
-				case i == 2:
-					return "Type a folder path manually (~ is expanded)."
-				default:
-					return dirPreview(filepath.Join(dir, items[i]))
-				}
-			}),
-		)
-		if err != nil {
-			return "", err
+		items := make([]item, len(subs))
+		for i, name := range subs {
+			items[i] = item{kind: itemDir, label: name + "/", value: filepath.Join(dir, name)}
 		}
-
-		switch idx {
-		case 0:
-			return dir, nil
-		case 1:
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				// Already at a root; on Windows offer switching drives.
-				if next, ok := pickDrive(); ok {
-					dir = next
-				}
-				continue
-			}
-			dir = parent
-		case 2:
-			typed, err := ui.InputDir("Key folder", dir)
-			if err != nil {
-				if isAbort(err) {
-					continue // back to the browser
-				}
-				return "", err
-			}
-			return typed, nil
-		default:
-			dir = filepath.Join(dir, items[idx])
-		}
+		s.list.ResetFilter()
+		cmd := s.list.SetItems(toListItems(items))
+		s.list.Select(max(slices.Index(subs, selectName), 0))
+		return cmd
 	}
+	finish := func(m *model, chosen string) tea.Cmd {
+		m.popScreen(s)
+		return choose(m, chosen)
+	}
+
+	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
+		it := s.selected()
+		switch {
+		case key.Matches(msg, m.keys.Open):
+			if it.kind == itemNone {
+				return nil, true
+			}
+			dir = it.value
+			return show(""), true
+		case key.Matches(msg, m.keys.Parent):
+			if atDrives {
+				return nil, true
+			}
+			if parent := filepath.Dir(dir); parent != dir {
+				child := filepath.Base(dir)
+				dir = parent
+				return show(child), true
+			}
+			drives := listDrives() // at a root: offer switching drives (Windows)
+			if len(drives) == 0 {
+				return nil, true
+			}
+			atDrives = true
+			s.list.Title = "Drives"
+			s.empty = ""
+			items := make([]item, len(drives))
+			for i, d := range drives {
+				items[i] = item{kind: itemDrive, label: d, value: d}
+			}
+			s.list.ResetFilter()
+			return s.list.SetItems(toListItems(items)), true
+		case key.Matches(msg, m.keys.UseDir):
+			if atDrives {
+				if it.kind == itemNone {
+					return nil, true
+				}
+				return finish(m, it.value), true
+			}
+			return finish(m, dir), true
+		case key.Matches(msg, m.keys.TypePath):
+			var typed string
+			current := dir
+			return m.push(formScreen(pathForm(current, &typed), func(m *model) tea.Cmd {
+				return finish(m, config.ExpandHome(orDefault(typed, current)))
+			})), true
+		}
+		return nil, false
+	}
+	show("")
+	return s
+}
+
+// pathForm asks for a folder path, validating that it exists.
+func pathForm(current string, value *string) *huh.Form {
+	return inputForm("Folder path", current, value, func(s string) error {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return nil
+		}
+		info, err := os.Stat(config.ExpandHome(s))
+		if err != nil || !info.IsDir() {
+			return errors.New("folder not found")
+		}
+		return nil
+	})
 }
 
 // listSubdirs returns the names of dir's subfolders (hidden ones included,
@@ -307,7 +444,7 @@ func listSubdirs(dir string) []string {
 	return subs
 }
 
-// dirPreview summarizes a folder for the browser's preview pane.
+// dirPreview summarizes a folder for the browser's details pane.
 func dirPreview(path string) string {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -325,11 +462,11 @@ func dirPreview(path string) string {
 	return fmt.Sprintf("%s\n\n%d subfolder(s)\n%d *%s file(s)", path, dirs, keys, keyExt)
 }
 
-// pickDrive lets the user switch drives when browsing up from a drive root
-// (Windows only). Returns false if unavailable or cancelled.
-func pickDrive() (string, bool) {
+// listDrives returns the available drive roots on Windows (nil elsewhere),
+// offered when browsing up from a drive root.
+func listDrives() []string {
 	if runtime.GOOS != "windows" {
-		return "", false
+		return nil
 	}
 	var drives []string
 	for c := 'A'; c <= 'Z'; c++ {
@@ -338,13 +475,5 @@ func pickDrive() (string, bool) {
 			drives = append(drives, p)
 		}
 	}
-	if len(drives) == 0 {
-		return "", false
-	}
-	idx, err := fuzzyfinder.Find(drives, func(i int) string { return "💾 " + drives[i] },
-		fuzzyfinder.WithHeader("Switch drive"))
-	if err != nil {
-		return "", false
-	}
-	return drives[idx], true
+	return drives
 }

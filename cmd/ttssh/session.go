@@ -1,7 +1,7 @@
 package main
 
-// The interactive session flow: choosing a connection (recents or new),
-// and the SSH / copy-to / copy-from action loop against it.
+// The dashboard screen and the session flows that start from it: resolving
+// a recent connection's key, ssh, and copying files to/from the remote host.
 
 import (
 	"context"
@@ -13,257 +13,316 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/huh"
-	"github.com/ktr0731/go-fuzzyfinder"
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"ttssh/internal/config"
 	"ttssh/internal/ui"
 	"ttssh/internal/vault"
 )
 
-// session is an active connection target.
+// session is a connection target with its key file resolved.
 type session struct {
-	Key     string // key file path passed to ssh/scp -i
-	Label   string // what to show for the key (path, or ☁ unit for vault keys)
-	VaultID string // vault unit id when the key came from the vault
-	User    string
-	Host    string
+	Key  string // key file path passed to ssh/scp -i
+	User string
+	Host string
 }
 
 func (s session) target() string { return s.User + "@" + s.Host }
 
-// recentKey is what goes into the recents list: vault keys are stored as a
-// "vault:<unit>" marker (re-fetched on use), local keys as their path.
-func (s session) recentKey() string {
-	if s.VaultID != "" {
-		return vaultRecentPrefix + s.VaultID
+// run shows the dashboard until the user quits.
+func run(ctx context.Context, cfg *config.Config, keyDir string, vaultTempDir *string, version string) error {
+	vlt, vaultErr := connectVault(*cfg)
+	m := newModel(ctx, cfg, vlt, vaultTempDir, keyDir, version)
+	startup := []tea.Cmd{m.pushDashboard()}
+	if vaultErr != nil {
+		startup = append(startup, m.setStatus(statusWarn, "vault: "+vaultErr.Error()))
 	}
-	return s.Key
+	m.startup = tea.Batch(startup...)
+	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	return err
 }
 
-// chooseSession offers recent connections (if any) or builds a new one.
-// keyDir may be updated if the user switches folders in the key picker.
-// vaultTempDir is threaded through to materializeVaultKey (see vaultcmd.go).
-func chooseSession(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (session, error) {
-	for {
-		if len(cfg.Recents) == 0 {
-			return newSession(ctx, cfg, keyDir, vlt, vaultTempDir)
-		}
+// ---- dashboard ----
 
-		opts := make([]huh.Option[int], 0, len(cfg.Recents)+1)
-		for i, r := range cfg.Recents {
-			keyName := filepath.Base(r.Key)
-			if id, ok := strings.CutPrefix(r.Key, vaultRecentPrefix); ok {
-				keyName = "☁ " + id
-			}
-			label := fmt.Sprintf("%-26s  %-20s %s",
-				r.User+"@"+r.Host, keyName, ui.RelTime(r.LastUsed))
-			opts = append(opts, huh.NewOption(label, i))
-		}
-		opts = append(opts, huh.NewOption("＋ New connection", -1))
+func (m *model) pushDashboard() tea.Cmd {
+	s := &screen{
+		kind:    screenDashboard,
+		list:    newList("Connections", "entry", "entries", m.connectionItems()),
+		actions: []key.Binding{m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.New, m.keys.Remove},
+		details: m.connectionDetails,
+		onKey:   dashboardKey,
+		onBack:  func(*model) tea.Cmd { return nil }, // the root has nowhere to go back to
+	}
+	return m.push(s)
+}
 
-		idx, err := ui.SelectOne("Connect to", opts)
-		if err != nil {
-			return session{}, err
-		}
-		if idx == -1 {
-			return newSession(ctx, cfg, keyDir, vlt, vaultTempDir)
-		}
+func (m *model) connectionItems() []item {
+	items := make([]item, 0, len(m.cfg.Recents)+1)
+	for _, r := range m.cfg.Recents {
+		label := fmt.Sprintf("%-24s %-18s %s", r.User+"@"+r.Host, recentKeyName(r), ui.RelTime(r.LastUsed))
+		items = append(items, item{kind: itemRecent, label: label, recent: r})
+	}
+	return append(items, item{kind: itemNewConnection, label: "＋ New connection"})
+}
 
-		r := cfg.Recents[idx]
-		if unitID, ok := strings.CutPrefix(r.Key, vaultRecentPrefix); ok {
-			if vlt == nil {
-				ui.PrintWarn("This entry uses a vault key, but the vault is not configured (ttssh vault setup).")
-				continue
-			}
-			path, err := materializeVaultKey(ctx, vlt, unitID, vaultTempDir)
-			if err != nil {
-				ui.PrintWarn(err.Error())
-				if errors.Is(err, vault.ErrUnitNotFound) {
-					cfg.RemoveRecent(r)
-				}
-				continue
-			}
-			return session{Key: path, Label: vaultLabel(unitID), VaultID: unitID, User: r.User, Host: r.Host}, nil
+// recentKeyName is the short key label: the file name, or ☁ unit for vault keys.
+func recentKeyName(r config.Recent) string {
+	if id, ok := strings.CutPrefix(r.Key, vaultRecentPrefix); ok {
+		return "☁ " + id
+	}
+	return filepath.Base(r.Key)
+}
+
+// refreshDashboard rebuilds the connections list after cfg.Recents changed
+// and selects the row at index (clamped).
+func (m *model) refreshDashboard(index int) tea.Cmd {
+	s := m.stack[0]
+	items := m.connectionItems()
+	s.list.ResetFilter()
+	cmd := s.list.SetItems(toListItems(items))
+	s.list.Select(min(max(index, 0), len(items)-1))
+	return cmd
+}
+
+func (m *model) connectionDetails(it item) string {
+	row := func(label, value string) string {
+		return ui.MutedStyle.Render(fmt.Sprintf("%-10s ", label)) + value + "\n"
+	}
+	hint := func(k, desc string) string {
+		return ui.KeyStyle.Render(fmt.Sprintf("%-6s", k)) + " " + desc + "\n"
+	}
+	if it.kind == itemNewConnection {
+		text := "Pick a key, then enter the user and host.\n\n" + hint("enter", "set up a new connection")
+		if len(m.cfg.Recents) == 0 {
+			text = ui.MutedStyle.Render("No recent connections yet.") + "\n\n" + text
 		}
+		return text
+	}
+	r := it.recent
+	keyDesc := r.Key
+	if id, ok := strings.CutPrefix(r.Key, vaultRecentPrefix); ok {
+		keyDesc = vaultLabel(id)
+	}
+	return row("Target", r.User+"@"+r.Host) +
+		row("Key", keyDesc) +
+		row("Last used", ui.RelTime(r.LastUsed)+" ("+r.LastUsed.Format("2006-01-02 15:04")+")") +
+		"\n" +
+		hint("enter", "ssh into the host") +
+		hint("u", "upload a file to the host") +
+		hint("d", "download a file from the host") +
+		hint("x", "remove from recents")
+}
+
+func dashboardKey(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
+	it := m.top().selected()
+	switch {
+	case key.Matches(msg, m.keys.New):
+		return m.openKeyPicker(), true
+	case key.Matches(msg, m.keys.Connect) && it.kind == itemNewConnection:
+		return m.openKeyPicker(), true
+	case !key.Matches(msg, m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.Remove):
+		return nil, false
+	case it.kind != itemRecent:
+		return m.setStatus(statusInfo, "Select a connection first."), true
+	case key.Matches(msg, m.keys.Connect):
+		return m.connect(it.recent, m.sshInto), true
+	case key.Matches(msg, m.keys.Upload):
+		return m.connect(it.recent, m.startUpload), true
+	case key.Matches(msg, m.keys.Download):
+		return m.connect(it.recent, m.startDownload), true
+	default: // remove
+		r := it.recent
+		m.removing = &r
+		return nil, true
+	}
+}
+
+func (m *model) confirmRemoveKey(msg tea.KeyMsg) tea.Cmd {
+	r := *m.removing
+	switch {
+	case key.Matches(msg, m.keys.Yes):
+		m.removing = nil
+		index := m.stack[0].list.GlobalIndex()
+		m.cfg.RemoveRecent(r)
+		return tea.Batch(m.refreshDashboard(index),
+			m.setStatus(statusSuccess, "Removed "+r.User+"@"+r.Host+" from recents."))
+	case key.Matches(msg, m.keys.No):
+		m.removing = nil
+	}
+	return nil
+}
+
+// connect resolves r's key file, fetching vault keys into the session temp
+// dir, bumps r to the top of the recents, and continues with then.
+func (m *model) connect(r config.Recent, then func(session) tea.Cmd) tea.Cmd {
+	unitID, isVault := strings.CutPrefix(r.Key, vaultRecentPrefix)
+	if !isVault {
 		if _, err := os.Stat(r.Key); err != nil {
-			ui.PrintWarn("Key file " + r.Key + " no longer exists — removing this entry.")
-			cfg.RemoveRecent(r)
-			continue
+			index := m.stack[0].list.GlobalIndex()
+			m.cfg.RemoveRecent(r)
+			return tea.Batch(m.refreshDashboard(index),
+				m.setStatus(statusWarn, "Key file "+r.Key+" no longer exists — removed this entry."))
 		}
-		return session{Key: r.Key, Label: r.Key, User: r.User, Host: r.Host}, nil
+		return m.useRecent(r, r.Key, then)
 	}
+	if m.vlt == nil {
+		return m.setStatus(statusWarn, "This entry uses a vault key, but the vault is not configured (ttssh vault setup).")
+	}
+
+	vlt := m.vlt
+	return m.startOp("Fetching "+unitID+" from the vault…", true, func(ctx context.Context) func(*model) tea.Cmd {
+		keyData, err := vlt.FetchKey(ctx, unitID)
+		return func(m *model) tea.Cmd {
+			if err != nil {
+				cmd := m.setStatus(statusWarn, err.Error())
+				if errors.Is(err, vault.ErrUnitNotFound) {
+					index := m.stack[0].list.GlobalIndex()
+					m.cfg.RemoveRecent(r)
+					cmd = tea.Batch(cmd, m.refreshDashboard(index))
+				}
+				return cmd
+			}
+			path, err := writeSessionKey(m.tempDir, unitID, keyData)
+			if err != nil {
+				return m.setStatus(statusError, err.Error())
+			}
+			return m.useRecent(r, path, then)
+		}
+	})
 }
 
-// newSession fuzzy-picks a key then asks for username and host.
-func newSession(ctx context.Context, cfg *config.Config, keyDir *string, vlt *vault.Client, vaultTempDir *string) (session, error) {
-	key, err := pickKey(ctx, cfg, keyDir, vlt, vaultTempDir)
-	if err != nil {
-		return session{}, err
-	}
-
-	var user, host string
-	noSpaces := func(what string) func(string) error {
-		return func(s string) error {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				return fmt.Errorf("%s is required", what)
-			}
-			if strings.ContainsAny(s, " \t") {
-				return fmt.Errorf("%s must not contain spaces", what)
-			}
-			return nil
-		}
-	}
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewInput().Title("Username").Placeholder("root").
-			Validate(noSpaces("username")).Value(&user),
-		huh.NewInput().Title("Host (IP or hostname)").Placeholder("192.168.1.10").
-			Validate(noSpaces("host")).Value(&host),
-	)).WithTheme(ui.HuhTheme())
-	if err := form.Run(); err != nil {
-		return session{}, err
-	}
-
-	return session{
-		Key: key.Path, Label: key.Label, VaultID: key.VaultID,
-		User: strings.TrimSpace(user), Host: strings.TrimSpace(host),
-	}, nil
+func (m *model) useRecent(r config.Recent, keyPath string, then func(session) tea.Cmd) tea.Cmd {
+	m.cfg.AddRecent(r)
+	return tea.Batch(m.refreshDashboard(0), then(session{Key: keyPath, User: r.User, Host: r.Host}))
 }
 
-type action int
+func (m *model) sshInto(sess session) tea.Cmd {
+	return m.runTerminal("", "ssh", "-i", sess.Key, sess.target())
+}
 
-const (
-	actionSSH action = iota
-	actionCopyTo
-	actionCopyFrom
-	actionSwitch
-	actionQuit
-)
+// ---- copy TO the remote host ----
 
-// actionLoop runs actions against sess until the user quits or switches
-// connection. Returns true when the user wants to pick another connection.
-func actionLoop(ctx context.Context, sess session) (bool, error) {
-	for {
-		fmt.Println()
-		ui.PrintSessionCard(sess.target(), sess.Label)
-		choice, err := ui.SelectOne(
-			"What next?",
-			[]huh.Option[action]{
-				huh.NewOption("🖥  SSH into the remote host", actionSSH),
-				huh.NewOption("📤 Copy a file TO the remote host", actionCopyTo),
-				huh.NewOption("📥 Copy a file FROM the remote host", actionCopyFrom),
-				huh.NewOption("🔁 Switch connection", actionSwitch),
-				huh.NewOption("👋 Quit", actionQuit),
-			})
+// startUpload asks for a local folder, lists its files, asks for the remote
+// destination, and scp's the chosen file.
+func (m *model) startUpload(sess session) tea.Cmd {
+	var dir string
+	return m.push(formScreen(inputForm("Local directory to search", ".", &dir, nil), func(m *model) tea.Cmd {
+		root := config.ExpandHome(orDefault(dir, "."))
+		files, err := listLocalFiles(root)
 		if err != nil {
-			if isAbort(err) {
-				return false, nil
-			}
-			return false, err
+			return m.setStatus(statusError, err.Error())
 		}
-
-		switch choice {
-		case actionSwitch:
-			return true, nil
-		case actionQuit:
-			return false, nil
-		case actionSSH:
-			err = runInteractive(ctx, "ssh", "-i", sess.Key, sess.target())
-		case actionCopyTo:
-			err = copyToRemote(ctx, sess)
-		case actionCopyFrom:
-			err = copyFromRemote(ctx, sess)
+		if len(files) == 0 {
+			return m.setStatus(statusWarn, "No files found under "+root+".")
 		}
-
-		switch {
-		case err == nil:
-			// menu comes back around
-		case isAbort(err):
-			ui.PrintNote("Cancelled.")
-		default:
-			return false, err
+		items := make([]item, len(files))
+		for i, f := range files {
+			items[i] = item{kind: itemFile, label: f, value: f}
 		}
-	}
+		return m.push(m.fileList("Upload to "+sess.target(), items, localFileDetails, func(m *model, local string) tea.Cmd {
+			var dest string
+			form := inputForm("Remote destination path", "~/", &dest, nil)
+			return m.push(formScreen(form, func(m *model) tea.Cmd {
+				remote := orDefault(dest, "~/")
+				m.popTo(1)
+				return m.runTerminal("Copied "+filepath.Base(local)+" to "+sess.target()+":"+remote,
+					"scp", "-i", sess.Key, local, sess.target()+":"+remote)
+			}))
+		}))
+	}))
 }
 
-// copyToRemote fuzzy-selects a local file and scp's it to the remote host.
-func copyToRemote(ctx context.Context, sess session) error {
-	startDir, err := ui.InputLine("Local directory to search", ".", false)
-	if err != nil {
-		return err
+// fileList is a filterable list of paths; enter hands the chosen one to choose.
+func (m *model) fileList(title string, items []item, details func(item) string, choose func(m *model, path string) tea.Cmd) *screen {
+	s := &screen{
+		kind:    screenFiles,
+		list:    newList(title, "file", "files", items),
+		actions: []key.Binding{m.keys.Select},
+		details: details,
 	}
-	files, err := listLocalFiles(config.ExpandHome(startDir))
-	if err != nil {
-		return err
+	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
+		if !key.Matches(msg, m.keys.Select) {
+			return nil, false
+		}
+		if it := s.selected(); it.kind != itemNone {
+			return choose(m, it.value), true
+		}
+		return nil, true
 	}
-	if len(files) == 0 {
-		ui.PrintWarn("No files found under " + startDir + ".")
+	return s
+}
+
+// localFileDetails describes a local file (or key file) for the details pane.
+func localFileDetails(it item) string {
+	info, err := os.Stat(it.value)
+	if err != nil {
+		return it.value + "\n\n" + ui.MutedStyle.Render("(unreadable)")
+	}
+	return it.value + "\n\n" +
+		ui.MutedStyle.Render("size      ") + fmt.Sprintf("%d bytes", info.Size()) + "\n" +
+		ui.MutedStyle.Render("modified  ") + info.ModTime().Format("2006-01-02 15:04")
+}
+
+// ---- copy FROM the remote host ----
+
+// startDownload asks for a remote folder, lists its files over ssh (falling
+// back to typing the path), asks for the local destination, and scp's it.
+func (m *model) startDownload(sess session) tea.Cmd {
+	var dir string
+	return m.push(formScreen(inputForm("Remote directory to search", "~", &dir, nil), func(m *model) tea.Cmd {
+		remoteDir := orDefault(dir, "~")
+		return m.startOp("Listing files on "+sess.target()+"…", true, func(ctx context.Context) func(*model) tea.Cmd {
+			files, _ := listRemoteFiles(ctx, sess, remoteDir) // any failure ends in the manual fallback below
+			return func(m *model) tea.Cmd {
+				if len(files) == 0 {
+					return tea.Batch(m.setStatus(statusWarn, "Could not list remote files; enter the path manually."),
+						m.askRemotePath(sess))
+				}
+				items := make([]item, len(files))
+				for i, f := range files {
+					items[i] = item{kind: itemFile, label: f, value: f}
+				}
+				details := func(it item) string { return sess.target() + ":" + it.value }
+				return m.push(m.fileList("Download from "+sess.target(), items, details, func(m *model, remote string) tea.Cmd {
+					return m.askLocalDest(sess, remote)
+				}))
+			}
+		})
+	}))
+}
+
+func (m *model) askRemotePath(sess session) tea.Cmd {
+	var path string
+	required := func(s string) error {
+		if strings.TrimSpace(s) == "" {
+			return errors.New("required")
+		}
 		return nil
 	}
-
-	idx, err := fuzzyfinder.Find(files, func(i int) string {
-		return files[i]
-	}, fuzzyfinder.WithHeader("Select local file to copy to "+sess.target()))
-	if err != nil {
-		return err
-	}
-	local := files[idx]
-
-	dest, err := ui.InputLine("Remote destination path", "~/", false)
-	if err != nil {
-		return err
-	}
-	if err := runInteractive(ctx, "scp", "-i", sess.Key, local, sess.target()+":"+dest); err != nil {
-		return err
-	}
-	ui.PrintSuccess("Copied " + filepath.Base(local) + " to " + sess.target() + ":" + dest)
-	return nil
+	return m.push(formScreen(inputForm("Remote file path", "", &path, required), func(m *model) tea.Cmd {
+		return m.askLocalDest(sess, strings.TrimSpace(path))
+	}))
 }
 
-// copyFromRemote lists remote files over ssh, fuzzy-selects one, and scp's it back.
-func copyFromRemote(ctx context.Context, sess session) error {
-	remoteDir, err := ui.InputLine("Remote directory to search", "~", false)
-	if err != nil {
-		return err
-	}
-
-	remote, err := pickRemoteFile(ctx, sess, remoteDir)
-	if err != nil {
-		return err
-	}
-
-	dest, err := ui.InputLine("Local destination path", ".", false)
-	if err != nil {
-		return err
-	}
-	if err := runInteractive(ctx, "scp", "-i", sess.Key, sess.target()+":"+remote, config.ExpandHome(dest)); err != nil {
-		return err
-	}
-	ui.PrintSuccess("Copied " + sess.target() + ":" + remote + " to " + dest)
-	return nil
+func (m *model) askLocalDest(sess session, remote string) tea.Cmd {
+	var dest string
+	return m.push(formScreen(inputForm("Local destination path", ".", &dest, nil), func(m *model) tea.Cmd {
+		local := orDefault(dest, ".")
+		m.popTo(1)
+		return m.runTerminal("Copied "+sess.target()+":"+remote+" to "+local,
+			"scp", "-i", sess.Key, sess.target()+":"+remote, config.ExpandHome(local))
+	}))
 }
 
-// pickRemoteFile runs find on the remote host and fuzzy-selects from the result.
-// If remote listing fails (e.g. no find command), it falls back to manual entry.
-func pickRemoteFile(ctx context.Context, sess session, remoteDir string) (string, error) {
-	ui.PrintNote("Listing remote files...")
-	cmd := exec.CommandContext(ctx, "ssh", "-i", sess.Key, sess.target(),
+// listRemoteFiles runs find on the remote host. BatchMode stops ssh from
+// prompting (passphrase, host key) while the TUI owns the terminal; such
+// hosts fall back to typing the path.
+func listRemoteFiles(ctx context.Context, sess session, remoteDir string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", "-i", sess.Key, sess.target(),
 		fmt.Sprintf("find %s -maxdepth 6 -type f 2>/dev/null", remoteDir))
 	out, err := cmd.Output()
-	files := splitLines(string(out))
-	if err != nil || len(files) == 0 {
-		ui.PrintWarn("Could not list remote files; enter the path manually.")
-		return ui.InputLine("Remote file path", "", true)
-	}
-
-	idx, err := fuzzyfinder.Find(files, func(i int) string {
-		return files[i]
-	}, fuzzyfinder.WithHeader("Select remote file on "+sess.target()))
-	if err != nil {
-		return "", err
-	}
-	return files[idx], nil
+	return splitLines(string(out)), err
 }
 
 // listLocalFiles walks dir collecting files, skipping dot-directories and
@@ -291,27 +350,6 @@ func listLocalFiles(dir string) ([]string, error) {
 		return nil
 	})
 	return files, err
-}
-
-// runInteractive runs a command wired to the user's terminal (needed for
-// interactive ssh sessions and scp progress output). A non-zero exit from
-// the command is reported but not treated as a ttssh error, so the action
-// menu comes back afterwards.
-func runInteractive(ctx context.Context, name string, args ...string) error {
-	ui.PrintCommand(name, args)
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			ui.PrintWarn(fmt.Sprintf("%s exited with code %d", name, exitErr.ExitCode()))
-			return nil
-		}
-		return fmt.Errorf("running %s: %w (is it installed and on PATH?)", name, err)
-	}
-	return nil
 }
 
 func splitLines(s string) []string {

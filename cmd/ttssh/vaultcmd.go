@@ -19,19 +19,15 @@ import (
 	"ttssh/internal/vault"
 )
 
-// connectVault opens the vault if it is configured; a misconfigured vault
-// warns and returns nil so the local-keys flow keeps working.
-func connectVault(cfg config.Config) *vault.Client {
+// connectVault opens the vault if it is configured. It returns nil, nil when
+// no vault is configured; on a misconfigured vault the caller warns and the
+// local-keys flow keeps working.
+func connectVault(cfg config.Config) (*vault.Client, error) {
 	vc := vault.ResolveConfig(cfg)
 	if !vc.Configured() {
-		return nil
+		return nil, nil
 	}
-	v, err := vault.Open(vc)
-	if err != nil {
-		ui.PrintWarn("vault: " + err.Error())
-		return nil
-	}
-	return v
+	return vault.Open(vc)
 }
 
 // ---- session temp keys ----
@@ -44,15 +40,12 @@ const (
 	keyFilePerm = 0o600
 )
 
-// materializeVaultKey fetches and decrypts unitID, writing it to a session
-// temp directory. *tempDir holds that directory's path across calls so the
-// temp dir is created at most once per run; the caller (main) owns it and is
-// responsible for calling cleanupVaultTemp on exit.
-func materializeVaultKey(ctx context.Context, v *vault.Client, unitID string, tempDir *string) (string, error) {
-	key, err := v.FetchKey(ctx, unitID)
-	if err != nil {
-		return "", err
-	}
+// writeSessionKey writes unitID's decrypted key to the session temp
+// directory. *tempDir holds that directory's path across calls so the temp
+// dir is created at most once per run; the caller (main) owns it and is
+// responsible for calling cleanupVaultTemp on exit. The dashboard fetches
+// the key in a tea.Cmd and calls this only from Update.
+func writeSessionKey(tempDir *string, unitID string, key []byte) (string, error) {
 	if *tempDir == "" {
 		dir, err := os.MkdirTemp("", "ttssh-vault-")
 		if err != nil {
@@ -98,19 +91,11 @@ func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string)
 		return nil
 	}
 
-	opts := make([]huh.Option[string], 0, len(units))
-	for _, u := range units {
-		label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
-		if u.Revoked() {
-			label += "  (revoked)"
-		}
-		opts = append(opts, huh.NewOption(label, u.UnitID))
-	}
 	var selected []string
 	err = huh.NewMultiSelect[string]().
 		Title("Download which keys?").
 		Description("Space toggles · a toggles all · Enter confirms").
-		Options(opts...).
+		Options(unitOptions(units)...).
 		Value(&selected).
 		WithTheme(ui.HuhTheme()).
 		Run()
@@ -123,36 +108,62 @@ func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string)
 	}
 
 	ui.PrintNote("Where should the keys be saved?")
-	dir, err := browseDir(startDir)
+	dir, err := browseDir(ctx, startDir)
 	if err != nil {
 		return err
 	}
 
-	saved, err := saveVaultKeys(ctx, v, selected, dir, confirmOverwrite)
+	saved, err := saveVaultKeys(ctx, v, selected, dir, confirmOverwrite, cliNotifier())
 	if saved > 0 {
 		ui.PrintSuccess(fmt.Sprintf("Saved %d key file(s) to %s", saved, dir))
 	}
 	return err
 }
 
-// confirmOverwrite asks before replacing an existing file (interactive flow).
-func confirmOverwrite(dest string) (bool, error) {
-	ok := false
-	err := huh.NewConfirm().
+// unitOptions lists vault units for a multi-select, marking revoked ones.
+func unitOptions(units []vault.Unit) []huh.Option[string] {
+	opts := make([]huh.Option[string], 0, len(units))
+	for _, u := range units {
+		label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
+		if u.Revoked() {
+			label += "  (revoked)"
+		}
+		opts = append(opts, huh.NewOption(label, u.UnitID))
+	}
+	return opts
+}
+
+// overwriteConfirm asks before replacing the existing file dest.
+func overwriteConfirm(dest string, ok *bool) *huh.Confirm {
+	return huh.NewConfirm().
 		Title(filepath.Base(dest) + " already exists — overwrite?").
 		Description(dest).
 		Affirmative("Overwrite").
 		Negative("Skip").
-		Value(&ok).
-		WithTheme(ui.HuhTheme()).
-		Run()
+		Value(ok)
+}
+
+// confirmOverwrite asks before replacing an existing file (interactive flow).
+func confirmOverwrite(dest string) (bool, error) {
+	ok := false
+	err := overwriteConfirm(dest, &ok).WithTheme(ui.HuhTheme()).Run()
 	return ok, err
+}
+
+// saveNotifier receives saveVaultKeys' per-file messages: the CLI prints
+// them, the dashboard collects them for its status line.
+type saveNotifier struct {
+	saved, skipped, failed func(msg string)
+}
+
+func cliNotifier() saveNotifier {
+	return saveNotifier{saved: ui.PrintSuccess, skipped: ui.PrintNote, failed: ui.PrintWarn}
 }
 
 // saveVaultKeys fetches, decrypts, and writes each unit to dir as
 // <unit>.key (0600). onConflict decides what happens to existing files;
 // nil means "refuse". Returns how many files were written.
-func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error)) (int, error) {
+func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error), notify saveNotifier) (int, error) {
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
 		return 0, fmt.Errorf("destination folder %s does not exist", dir)
@@ -162,7 +173,7 @@ func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir s
 		dest := filepath.Join(dir, id+".key")
 		if _, err := os.Stat(dest); err == nil {
 			if onConflict == nil {
-				ui.PrintWarn(dest + " already exists — skipping (use -force to overwrite)")
+				notify.failed(dest + " already exists — skipping (use -force to overwrite)")
 				continue
 			}
 			ok, err := onConflict(dest)
@@ -170,19 +181,19 @@ func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir s
 				return saved, err
 			}
 			if !ok {
-				ui.PrintNote("Skipped " + id + ".")
+				notify.skipped("Skipped " + id + ".")
 				continue
 			}
 		}
 		key, err := v.FetchKey(ctx, id)
 		if err != nil {
-			ui.PrintWarn(err.Error())
+			notify.failed(err.Error())
 			continue
 		}
 		if err := os.WriteFile(dest, key, keyFilePerm); err != nil {
 			return saved, fmt.Errorf("writing %s: %w", dest, err)
 		}
-		ui.PrintSuccess("Saved " + dest)
+		notify.saved("Saved " + dest)
 		saved++
 	}
 	return saved, nil
@@ -294,17 +305,9 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 		if err != nil {
 			return fmt.Errorf("listing vault keys: %w", err)
 		}
-		opts := make([]huh.Option[string], 0, len(units))
-		for _, u := range units {
-			label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
-			if u.Revoked() {
-				label += "  (revoked)"
-			}
-			opts = append(opts, huh.NewOption(label, u.UnitID))
-		}
 		if err := huh.NewMultiSelect[string]().
 			Title("Download which keys?").
-			Options(opts...).
+			Options(unitOptions(units)...).
 			Value(&ids).
 			WithTheme(ui.HuhTheme()).
 			Run(); err != nil {
@@ -319,7 +322,7 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 	dir := config.ExpandHome(out)
 	if dir == "" {
 		var err error
-		if dir, err = browseDir(config.ResolveKeyDir("", *cfg)); err != nil {
+		if dir, err = browseDir(ctx, config.ResolveKeyDir("", *cfg)); err != nil {
 			return err
 		}
 	}
@@ -328,7 +331,7 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 	if !force {
 		onConflict = nil // refuse, with a hint
 	}
-	saved, err := saveVaultKeys(ctx, v, ids, dir, onConflict)
+	saved, err := saveVaultKeys(ctx, v, ids, dir, onConflict, cliNotifier())
 	if err != nil {
 		return err
 	}
