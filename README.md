@@ -1,11 +1,12 @@
 # ttssh
 
-An interactive SSH manager for the terminal. Fuzzy-find your SSH key — from a
-local folder or straight out of the encrypted key vault — enter the target,
-then SSH in or copy files to/from the remote host, all from one flow.
+An interactive SSH manager for the terminal. A keyboard-driven dashboard lists
+your recent connections; pick an SSH key — from a local folder or straight out
+of the encrypted key vault — enter the target, then SSH in or copy files
+to/from the remote host without leaving the dashboard.
 
-Works on Windows, macOS, and Linux. The fzf-style fuzzy finder is built into the
-binary, so the only external requirement is the standard `ssh`/`scp` client
+Works on Windows, macOS, and Linux. The terminal UI is built into the binary,
+so the only external requirement is the standard `ssh`/`scp` client
 (preinstalled on macOS/Linux, and included with Windows 10+ as the built-in
 OpenSSH client).
 
@@ -15,26 +16,69 @@ OpenSSH client).
 ttssh
 ```
 
-The interactive flow:
+`ttssh` opens a full-screen dashboard:
 
-1. **Pick a connection** — your 10 most recent connections are offered first
-   (most recent on top, with the key name and how long ago you used it), or
-   choose **New connection** to set one up:
-   - **Pick a key** — fuzzy-search `*.key` files in your key directory (default `~/.ssh`),
-     with a preview of each key's path, size, and modified time. The first entry,
-     **choose a different folder…**, lets you switch to another folder on the spot
-     and optionally save it as the new default.
-   - **Enter the target** — username and IP/hostname.
-2. **Pick an action** (the menu returns after each action, so you can run several):
-   - **SSH into the remote host** — opens an interactive session (`ssh -i <key> user@host`).
-   - **Copy a file TO the remote host** — fuzzy-search a local file, enter the remote destination, copies via `scp`.
-   - **Copy a file FROM the remote host** — lists remote files over SSH, fuzzy-search one, enter the local destination, copies via `scp`. Falls back to manual path entry if the remote can't be listed.
-   - **Switch connection** — go back to the connection list.
-   - **Quit**
+- **Header** — the version, the vault state (`☁ vault` or `vault off`), and the
+  active key folder.
+- **Connections** (left) — your 10 most recent connections, most recent first,
+  with the key name (`☁ unit` for vault keys) and how long ago you used it,
+  plus **＋ New connection**. Press `/` to filter.
+- **Details** (right) — the selected connection's target, key, last use, and
+  the actions available. Hidden when the terminal is narrower than 80 columns.
+- **Status line** — results and warnings (`✓` success, `!` warning, `✗` error),
+  cleared after a few seconds, and a spinner while ttssh waits on the vault or
+  the remote host.
+- **Footer** — the keys that work on the current screen; `?` shows them all.
 
-Press `Esc` inside a copy flow to cancel it and return to the action menu.
-Recent entries whose key file has been deleted are pruned automatically;
+From the dashboard:
+
+- **enter** — SSH into the selected host (`ssh -i <key> user@host`). The
+  dashboard steps aside while the session runs and comes back when it ends.
+- **u** — copy a file TO the host: enter a local folder (default `.`), filter
+  its files, enter the remote destination (default `~/`), and ttssh runs `scp`.
+- **d** — copy a file FROM the host: enter a remote folder (default `~`); ttssh
+  lists its files over SSH, you filter and pick one, then enter the local
+  destination (default `.`). If the remote can't be listed (or would need a
+  password/passphrase prompt), you type the remote path instead.
+- **n** (or enter on **＋ New connection**) — set up a new connection:
+  - **Pick a key** — vault keys (when the vault is configured) and the `*.key`
+    files in your key folder (default `~/.ssh`); the details pane shows each
+    key's path, size, and modified time, or its vault fingerprint and status.
+    Press `f` to switch to another folder (and optionally save it as the
+    default), or `p` to download vault keys into a folder.
+  - **Enter the target** — username and IP/hostname. The connection is added
+    to the top of the list, ready for enter/u/d.
+- **x** — remove the selected connection from the list (asks y/n first).
+
+`esc` clears an active filter or goes back one step, from any screen. Recent
+entries whose key file has been deleted are pruned automatically;
 `ttssh clear-recents` forgets the whole list.
+
+### Keybindings
+
+| Where | Key | Action |
+|---|---|---|
+| Everywhere | `↑`/`↓`, `k`/`j` | move |
+| | `pgup`/`pgdn` | page |
+| | `/` | filter the list (type to narrow, `enter` to apply) |
+| | `esc` | clear the filter, or go back one screen |
+| | `?` | toggle full help |
+| | `q` | quit (`ctrl+c` quits even while typing) |
+| Dashboard | `enter` | SSH into the selected connection |
+| | `u` | upload a file to the host |
+| | `d` | download a file from the host |
+| | `n` | new connection |
+| | `x` | remove the selected connection (`y` confirms) |
+| Key picker | `enter` | use the selected key |
+| | `f` | change the key folder |
+| | `p` | download vault keys to a folder |
+| Folder browser | `enter` | open the selected folder |
+| | `←`/`h`/`backspace` | parent folder (a drive list at a Windows drive root) |
+| | `space` or `.` | use the current folder |
+| | `t` | type a path (`~` is expanded) |
+
+While a filter or a text field is focused, letter keys type text instead of
+triggering actions.
 
 ## Key vault (Key-Upload-TUI database)
 
@@ -44,8 +88,8 @@ per-unit key, AES-256-GCM, unit id as AAD). Nothing is ever uploaded — ttssh
 is read-only against the vault.
 
 When the vault is configured, the key picker lists every stored unit as a
-`☁ unit-id` entry next to your local `*.key` files (with fingerprint and
-creation date in the preview pane). Picking one decrypts the key to a
+`☁ unit-id` entry next to your local `*.key` files (with fingerprint, creation
+date, and status in the details pane; revoked units are marked `(revoked)`). Picking one decrypts the key to a
 private temp file used just for that session and deleted when ttssh exits.
 Vault keys also work from the recents list — they are re-fetched on use, so
 no key material is persisted between runs.
@@ -79,24 +123,21 @@ ttssh vault setup                         save credentials to config.json
 
 `vault pull` writes each key as `<unit>.key` with owner-only permissions, so
 downloaded keys immediately show up in ttssh's normal key scanning. The same
-download flow is available inside the interactive key picker
-(**⬇ download vault keys to a folder…**).
+download flow is available inside the key picker (press `p`).
 
 ## Configuring the key directory
 
 Keys must end in `.key`. The default search directory is `~/.ssh`.
 
-The easiest way to change it is from inside the app: pick
-**choose a different folder…** at the top of the key list. This opens a
-fuzzy-searchable folder browser — type to filter the subfolders of the current
-folder, press Enter to step into one, and use **go up (..)** or
-**use this folder** to navigate and accept (a preview pane shows how many
-`*.key` files each folder contains). **type a path…** is still available for
-pasting a full path (`~` is expanded), and going up from a drive root on
-Windows offers a drive picker. After picking, choose whether to save the
-folder as the default or use it just for this session. If the configured
-folder is missing or has no keys, the browser opens automatically instead of
-an error.
+The easiest way to change it is from inside the app: press `f` in the key
+picker. This opens a folder browser — `/` filters the subfolders of the current
+folder, `enter` steps into one, `←`/`h`/`backspace` goes up, and `space` (or
+`.`) uses the current folder (the details pane shows how many `*.key` files
+each folder contains). `t` lets you type or paste a full path (`~` is
+expanded), and going up from a drive root on Windows offers a drive list.
+After picking, choose whether to save the folder as the default or use it
+just for this session. If the configured folder is missing or has no keys,
+the key picker says so and points you to `f`.
 
 It can also be set from the command line:
 
@@ -113,10 +154,11 @@ Linux, `~/Library/Application Support/ttssh/config.json` on macOS).
 ## Project layout
 
 ```
-cmd/ttssh/         CLI entry point: command dispatch, session flow,
-                   key picker / folder browser, vault subcommands
+cmd/ttssh/         CLI entry point: command dispatch, the Bubble Tea
+                   dashboard (tui.go), session flows, key picker /
+                   folder browser, vault subcommands
 internal/config/   persistent settings (config.json), recents, path helpers
-internal/ui/       shared terminal styling and prompt helpers
+internal/ui/       color palette, shared styles, huh theme, print helpers
 internal/vault/    key-vault client: Turso/libSQL access and v1 decryption
                    (plus the crypto interop tests)
 ```
@@ -138,10 +180,10 @@ GOOS=windows GOARCH=amd64 go build -o ttssh.exe ./cmd/ttssh
 Prebuilt binaries for Linux (amd64), macOS (arm64/amd64), and Windows (amd64)
 are attached to each [GitHub release](https://github.com/XiaoKChen/TTSSH/releases)
 (built automatically when a `v*` tag is pushed; local builds land in `dist/`) —
-everything, including the fuzzy finder and the vault client, is statically
+everything, including the terminal UI and the vault client, is statically
 compiled in; the only runtime requirement is `ssh`/`scp` on PATH.
 
-The binary reports its build version in the banner and in `ttssh config`; it is
+The binary reports its build version in the dashboard header and in `ttssh config`; it is
 injected at build time, so release and install-script builds are stamped with
 the git tag automatically.
 
@@ -191,6 +233,7 @@ gofmt -l .           # list files needing formatting
 
 ## Dependencies
 
-- `github.com/charmbracelet/huh` — interactive terminal forms and menus
-- `github.com/charmbracelet/lipgloss` — terminal styling for the banner and cards
-- `github.com/ktr0731/go-fuzzyfinder` — built-in fzf-style fuzzy finder
+- `github.com/charmbracelet/bubbletea` — the full-screen dashboard
+- `github.com/charmbracelet/bubbles` — list, help, and spinner components
+- `github.com/charmbracelet/huh` — forms embedded in the dashboard and the `vault` prompts
+- `github.com/charmbracelet/lipgloss` — terminal styling
