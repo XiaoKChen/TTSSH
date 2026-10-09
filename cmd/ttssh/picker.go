@@ -25,6 +25,8 @@ import (
 	"ttssh/internal/vault"
 )
 
+const noKeyLabel = "No key — log in with a password"
+
 // keyPicker is the key picker's state beyond its list.
 type keyPicker struct {
 	units   []vault.Unit
@@ -36,24 +38,26 @@ type keyPicker struct {
 func (m *model) openKeyPicker() tea.Cmd {
 	p := &keyPicker{}
 	s := &screen{
-		kind:    screenKeys,
-		list:    newList("Keys", "key", "keys", nil),
-		actions: []key.Binding{m.keys.Select, m.keys.Folder, m.keys.Pull},
-		details: keyDetails,
+		kind:      screenKeys,
+		list:      newList("Keys", "key", "keys"),
+		details:   keyDetails,
+		enterDesc: func(item) string { return "select" },
+	}
+	s.commands = func(m *model) []command {
+		cmds := []command{{"f", "change key folder", func(m *model) tea.Cmd { return m.changeKeyDir(s, p) }}}
+		if m.vlt != nil {
+			cmds = append(cmds, command{"p", "download vault keys", func(m *model) tea.Cmd { return m.pullVaultKeys(s, p) }})
+		}
+		return cmds
 	}
 	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
-		switch {
-		case key.Matches(msg, m.keys.Select):
-			if it := s.selected(); it.kind != itemNone {
-				return m.askTarget(it), true
-			}
-			return nil, true
-		case key.Matches(msg, m.keys.Folder):
-			return m.changeKeyDir(s, p), true
-		case key.Matches(msg, m.keys.Pull):
-			return m.pullVaultKeys(s, p), true
+		if !key.Matches(msg, m.keys.Enter) {
+			return nil, false
 		}
-		return nil, false
+		if it := s.selected(); it.kind != itemNone {
+			return m.askTarget(it), true
+		}
+		return nil, true
 	}
 
 	cmds := []tea.Cmd{m.push(s), m.reloadKeys(s, p)}
@@ -75,9 +79,10 @@ func (m *model) openKeyPicker() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// reloadKeys lists vault units first, then *.key files under m.keyDir.
+// reloadKeys lists the password option, then vault units, then *.key files
+// under m.keyDir.
 func (m *model) reloadKeys(s *screen, p *keyPicker) tea.Cmd {
-	var items []item
+	items := []item{{kind: itemNoKey, label: noKeyLabel}}
 	for _, u := range p.units {
 		label := "☁ " + u.UnitID
 		if u.Revoked() {
@@ -95,19 +100,18 @@ func (m *model) reloadKeys(s *screen, p *keyPicker) tea.Cmd {
 	}
 
 	s.list.Title = "Keys · " + m.keyDir
-	s.empty = ""
-	cmds := []tea.Cmd{s.list.SetItems(toListItems(items))}
+	cmds := []tea.Cmd{s.setItems(items)}
 	if scanErr != nil {
-		s.empty = scanErr.Error() + ".\n\nPress f to choose another folder."
-		if len(items) > 0 {
-			cmds = append(cmds, m.setStatus(statusInfo, scanErr.Error()))
-		}
+		cmds = append(cmds, m.setStatus(statusInfo, scanErr.Error()+" — press / then f to choose another folder."))
 	}
 	return tea.Batch(cmds...)
 }
 
 func keyDetails(it item) string {
-	if it.kind == itemLocalKey {
+	switch it.kind {
+	case itemNoKey:
+		return "Log in with a password.\n" + ui.MutedStyle.Render("ssh asks for it in the terminal; ttssh never stores passwords.")
+	case itemLocalKey:
 		return localFileDetails(it)
 	}
 	u := it.unit
@@ -121,26 +125,54 @@ func keyDetails(it item) string {
 		ui.MutedStyle.Render("status       ") + state
 }
 
-// askTarget collects the user and host for the chosen key, records the new
-// connection in the recents, and selects it on the dashboard.
+// askTarget collects the user and host for the chosen key and, optionally, a
+// folder to save the connection in. The connection always enters the recents
+// and is selected on the dashboard.
 func (m *model) askTarget(keyItem item) tea.Cmd {
 	keyRef, keyLabel := keyItem.value, keyItem.value
-	if keyItem.kind == itemVaultKey {
+	switch keyItem.kind {
+	case itemVaultKey:
 		keyRef, keyLabel = vaultRecentPrefix+keyItem.value, vaultLabel(keyItem.value)
+	case itemNoKey:
+		keyLabel = passwordKeyName + " (ssh asks for it; never stored)"
 	}
+
+	choices := append([]folderChoice{{label: dontSaveLabel, none: true}}, m.folderChoices(nil)...)
+	saveIdx := 0
+	if sel := m.stack[0].selected(); sel.kind == itemFolder || sel.kind == itemEntry {
+		if i := slices.IndexFunc(choices, func(c folderChoice) bool { return !c.none && slices.Equal(c.path, sel.path) }); i >= 0 {
+			saveIdx = i
+		}
+	}
+
 	var user, host string
-	form := newForm(huh.NewGroup(
-		huh.NewInput().Title("Username").Placeholder("root").
-			Validate(noSpaces("username")).Value(&user),
-		huh.NewInput().Title("Host (IP or hostname)").Placeholder("192.168.1.10").
-			Validate(noSpaces("host")).Value(&host),
-	).Title("New connection").Description("Key: " + keyLabel))
+	form := newForm(
+		huh.NewGroup(
+			huh.NewInput().Title("Username").Placeholder("root").
+				Validate(noSpaces("username")).Value(&user),
+			huh.NewInput().Title("Host (IP or hostname)").Placeholder("192.168.1.10").
+				Validate(noSpaces("host")).Value(&host),
+		).Title("New connection").Description("Key: "+keyLabel),
+		huh.NewGroup(folderSelect("Save to folder", choices, &saveIdx)).
+			Title("New connection").Description("Key: "+keyLabel),
+	)
 	return m.push(formScreen(form, func(m *model) tea.Cmd {
 		r := config.Recent{User: strings.TrimSpace(user), Host: strings.TrimSpace(host), Key: keyRef}
 		m.popTo(1)
 		m.cfg.AddRecent(r)
-		return tea.Batch(m.refreshDashboard(0),
-			m.setStatus(statusSuccess, "Added "+r.User+"@"+r.Host+" — press enter to connect."))
+		recentID := item{kind: itemRecent, recent: r}.id()
+		dest := choices[saveIdx]
+		if dest.none {
+			return tea.Batch(m.showRow(recentID),
+				m.setStatus(statusSuccess, "Added "+r.User+"@"+r.Host+" — press enter to connect."))
+		}
+		entry := config.Entry{User: r.User, Host: r.Host, Key: r.Key}
+		if err := m.cfg.AddEntry(dest.path, entry); err != nil {
+			return tea.Batch(m.showRow(recentID), m.setStatus(statusError, err.Error()))
+		}
+		m.reveal(dest.path)
+		return m.finishTreeChange(nil, "Saved "+r.User+"@"+r.Host+" to "+dest.label+" — press enter to connect.",
+			item{kind: itemEntry, entry: entry, path: dest.path}.id())
 	}))
 }
 
@@ -310,7 +342,6 @@ func browseDir(ctx context.Context, start string) (string, error) {
 		return m.quit()
 	})
 	s.onBack = func(m *model) tea.Cmd { return m.quit() }
-	s.actions = append(s.actions, m.keys.Cancel)
 	m.startup = m.push(s)
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		return "", fmt.Errorf("folder browser: %w", err)
@@ -333,23 +364,24 @@ func (m *model) folderBrowser(start string, choose func(m *model, dir string) te
 	}
 
 	s := &screen{
-		kind:    screenFolders,
-		list:    newList("", "folder", "folders", nil),
-		actions: []key.Binding{m.keys.Open, m.keys.Parent, m.keys.UseDir, m.keys.TypePath},
-		details: func(it item) string { return dirPreview(it.value) },
+		kind:      screenFolders,
+		list:      newList("", "folder", "folders"),
+		details:   func(it item) string { return dirPreview(it.value) },
+		enterDesc: func(item) string { return "open" },
+		hints:     []key.Binding{hint("←", "parent")},
 	}
 	// show lists dir's subfolders, selecting the one named selectName.
 	show := func(selectName string) tea.Cmd {
 		atDrives = false
+		s.query = ""
 		s.list.Title = "Folders · " + dir
-		s.empty = "No subfolders here.\n\nPress space to use this folder, or ← to go up."
+		s.empty = "No subfolders here.\n\nPress / then . to use this folder, or ← to go up."
 		subs := listSubdirs(dir)
 		items := make([]item, len(subs))
 		for i, name := range subs {
 			items[i] = item{kind: itemDir, label: name + "/", value: filepath.Join(dir, name)}
 		}
-		s.list.ResetFilter()
-		cmd := s.list.SetItems(toListItems(items))
+		cmd := s.setItems(items)
 		s.list.Select(max(slices.Index(subs, selectName), 0))
 		return cmd
 	}
@@ -357,52 +389,60 @@ func (m *model) folderBrowser(start string, choose func(m *model, dir string) te
 		m.popScreen(s)
 		return choose(m, chosen)
 	}
+	goUp := func() tea.Cmd {
+		if atDrives {
+			return nil
+		}
+		if parent := filepath.Dir(dir); parent != dir {
+			child := filepath.Base(dir)
+			dir = parent
+			return show(child)
+		}
+		drives := listDrives() // at a root: offer switching drives (Windows)
+		if len(drives) == 0 {
+			return nil
+		}
+		atDrives = true
+		s.query = ""
+		s.list.Title = "Drives"
+		s.empty = ""
+		items := make([]item, len(drives))
+		for i, d := range drives {
+			items[i] = item{kind: itemDrive, label: d, value: d}
+		}
+		return s.setItems(items)
+	}
 
-	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
-		it := s.selected()
-		switch {
-		case key.Matches(msg, m.keys.Open):
-			if it.kind == itemNone {
-				return nil, true
-			}
-			dir = it.value
-			return show(""), true
-		case key.Matches(msg, m.keys.Parent):
-			if atDrives {
-				return nil, true
-			}
-			if parent := filepath.Dir(dir); parent != dir {
-				child := filepath.Base(dir)
-				dir = parent
-				return show(child), true
-			}
-			drives := listDrives() // at a root: offer switching drives (Windows)
-			if len(drives) == 0 {
-				return nil, true
-			}
-			atDrives = true
-			s.list.Title = "Drives"
-			s.empty = ""
-			items := make([]item, len(drives))
-			for i, d := range drives {
-				items[i] = item{kind: itemDrive, label: d, value: d}
-			}
-			s.list.ResetFilter()
-			return s.list.SetItems(toListItems(items)), true
-		case key.Matches(msg, m.keys.UseDir):
-			if atDrives {
-				if it.kind == itemNone {
-					return nil, true
+	s.commands = func(m *model) []command {
+		return []command{
+			{".", "use this folder", func(m *model) tea.Cmd {
+				if !atDrives {
+					return finish(m, dir)
 				}
-				return finish(m, it.value), true
+				if it := s.selected(); it.kind != itemNone {
+					return finish(m, it.value)
+				}
+				return nil
+			}},
+			{"t", "type a path", func(m *model) tea.Cmd {
+				var typed string
+				current := dir
+				return m.push(formScreen(pathForm(current, &typed), func(m *model) tea.Cmd {
+					return finish(m, config.ExpandHome(orDefault(typed, current)))
+				}))
+			}},
+		}
+	}
+	s.onKey = func(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
+		switch {
+		case key.Matches(msg, m.keys.Enter):
+			if it := s.selected(); it.kind != itemNone {
+				dir = it.value
+				return show(""), true
 			}
-			return finish(m, dir), true
-		case key.Matches(msg, m.keys.TypePath):
-			var typed string
-			current := dir
-			return m.push(formScreen(pathForm(current, &typed), func(m *model) tea.Cmd {
-				return finish(m, config.ExpandHome(orDefault(typed, current)))
-			})), true
+			return nil, true
+		case key.Matches(msg, m.keys.Left, m.keys.Backspace): // backspace only gets here with an empty query
+			return goUp(), true
 		}
 		return nil, false
 	}

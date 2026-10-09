@@ -1,8 +1,13 @@
 package main
 
-// The Bubble Tea dashboard core: a stack of screens (filterable lists or
+// The Bubble Tea dashboard core: a stack of screens (type-to-filter lists or
 // embedded huh forms) framed by a header, a status line, and a help footer;
-// async operations; and handing the terminal to ssh/scp.
+// the "/" command popup; async operations; and handing the terminal to
+// ssh/scp.
+//
+// Keyboard model: on list screens every printable character except "/"
+// filters the list, and "/" opens a popup whose next keypress runs a
+// command. Forms and y/n confirmations keep their own keys.
 //
 // Concurrency rule: tea.Cmds only do I/O. Everything they produce is
 // applied in Update, which is the only place the model, *config.Config and
@@ -25,6 +30,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"ttssh/internal/config"
 	"ttssh/internal/ui"
@@ -36,15 +42,13 @@ const (
 	minDetailsWidth = 80 // narrower terminals hide the details pane
 	listPanePercent = 55 // share of the width taken by the list pane
 	minBodyHeight   = 5  // panel border, title, and at least one row
+	commandsKey     = "/"
 )
 
-// keyMap holds every binding the dashboard shows in its help footer.
+// keyMap holds the keys the model itself reacts to.
 type keyMap struct {
-	Up, Down, Filter, Back, Cancel, Help, Quit, ForceQuit key.Binding
-	Connect, Upload, Download, New, Remove, ClearAll      key.Binding
-	Select, Folder, Pull                                  key.Binding
-	Open, Parent, UseDir, TypePath                        key.Binding
-	Yes, No                                               key.Binding
+	ForceQuit, Back, Cancel, Yes, No        key.Binding
+	Enter, Left, Right, Backspace, Commands key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -52,41 +56,41 @@ func newKeyMap() keyMap {
 		return key.NewBinding(key.WithKeys(keys...), key.WithHelp(help, desc))
 	}
 	return keyMap{
-		Up:        bind("↑/k", "up", "up", "k"),
-		Down:      bind("↓/j", "down", "down", "j"),
-		Filter:    bind("/", "filter", "/"),
+		ForceQuit: bind("ctrl+c", "quit", "ctrl+c"),
 		Back:      bind("esc", "back", "esc"),
 		Cancel:    bind("esc", "cancel", "esc"),
-		Help:      bind("?", "help", "?"),
-		Quit:      bind("q", "quit", "q"),
-		ForceQuit: bind("ctrl+c", "quit", "ctrl+c"),
-		Connect:   bind("enter", "ssh", "enter"),
-		Upload:    bind("u", "upload", "u"),
-		Download:  bind("d", "download", "d"),
-		New:       bind("n", "new", "n"),
-		Remove:    bind("x", "remove", "x"),
-		ClearAll:  bind("X", "clear all", "X"),
-		Select:    bind("enter", "select", "enter"),
-		Folder:    bind("f", "change folder", "f"),
-		Pull:      bind("p", "download vault keys", "p"),
-		Open:      bind("enter", "open", "enter"),
-		Parent:    bind("←/h", "parent folder", "backspace", "ctrl+h", "h", "left"),
-		UseDir:    bind("space", "use this folder", " ", "."),
-		TypePath:  bind("t", "type a path", "t"),
 		Yes:       bind("y", "confirm", "y", "Y"),
 		No:        bind("n/esc", "cancel", "n", "N", "esc"),
+		Enter:     bind("enter", "select", "enter"),
+		Left:      bind("←", "left", "left"),
+		Right:     bind("→", "right", "right"),
+		Backspace: bind("backspace", "erase", "backspace", "ctrl+h"),
+		Commands:  bind(commandsKey, "commands", commandsKey),
 	}
 }
 
-// listKeyMap is the bubbles list keymap minus the keys the dashboard owns:
-// paging stays on pgup/pgdown so u/d/f/h/l/b remain free for actions, and
-// ?, q and ctrl+c are handled by the model.
+// hint builds a display-only binding for the footer.
+func hint(k, desc string) key.Binding {
+	return key.NewBinding(key.WithKeys(k), key.WithHelp(k, desc))
+}
+
+// listKeyMap is the bubbles list keymap reduced to arrow navigation: letters
+// belong to the type-to-filter query and the "/" popup, and the model handles
+// quitting.
 func listKeyMap() list.KeyMap {
 	km := list.DefaultKeyMap()
+	km.CursorUp.SetKeys("up")
+	km.CursorDown.SetKeys("down")
 	km.PrevPage.SetKeys("pgup")
 	km.PrevPage.SetHelp("pgup", "prev page")
 	km.NextPage.SetKeys("pgdown")
 	km.NextPage.SetHelp("pgdn", "next page")
+	km.GoToStart.SetKeys("home")
+	km.GoToEnd.SetKeys("end")
+	km.Filter.SetKeys()
+	km.ClearFilter.SetKeys()
+	km.CancelWhileFiltering.SetKeys()
+	km.AcceptWhileFiltering.SetKeys()
 	km.ShowFullHelp.SetKeys()
 	km.CloseFullHelp.SetKeys()
 	km.Quit.SetKeys()
@@ -99,6 +103,10 @@ type itemKind int
 const (
 	itemNone itemKind = iota // zero value: nothing selected
 	itemRecent
+	itemFolder
+	itemEntry
+	itemHeader
+	itemNoKey
 	itemVaultKey
 	itemLocalKey
 	itemDir
@@ -113,11 +121,26 @@ type item struct {
 	value  string // path, unit id, or remote path, depending on kind
 	recent config.Recent
 	unit   vault.Unit
+	entry  config.Entry
+	path   []string // folder rows: the folder's path; entry rows: the containing folder
 }
 
 func (i item) Title() string       { return i.label }
 func (i item) Description() string { return "" }
 func (i item) FilterValue() string { return i.label }
+
+// id identifies a row across list rebuilds so the selection can be kept.
+func (i item) id() string {
+	switch i.kind {
+	case itemFolder:
+		return "d:" + pathKey(i.path)
+	case itemEntry:
+		return "e:" + pathKey(i.path) + "\x00" + i.entry.User + "@" + i.entry.Host + "\x00" + i.entry.Key
+	case itemRecent:
+		return "r:" + i.recent.User + "@" + i.recent.Host + "\x00" + i.recent.Key
+	}
+	return fmt.Sprintf("%d:%s:%s", i.kind, i.value, i.label)
+}
 
 func toListItems(items []item) []list.Item {
 	out := make([]list.Item, len(items))
@@ -127,23 +150,38 @@ func toListItems(items []item) []list.Item {
 	return out
 }
 
-func newList(title, singular, plural string, items []item) list.Model {
+// filterItems keeps the items whose label contains every space-separated
+// term of query, ignoring case.
+func filterItems(items []item, query string) []item {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return items
+	}
+	var out []item
+	for _, it := range items {
+		label := strings.ToLower(it.label)
+		if !slices.ContainsFunc(terms, func(t string) bool { return !strings.Contains(label, t) }) {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func newList(title, singular, plural string) list.Model {
 	d := list.NewDefaultDelegate()
 	d.ShowDescription = false
 	d.SetSpacing(0)
 	d.Styles = ui.ListItemStyles()
 
-	l := list.New(toListItems(items), d, 0, 0)
+	l := list.New(nil, d, 0, 0)
 	l.Title = title
 	l.Styles = ui.ListStyles()
 	l.KeyMap = listKeyMap()
 	l.DisableQuitKeybindings()
-	l.SetFilteringEnabled(true) // recomputes which of the new bindings are active
+	l.SetFilteringEnabled(false) // the model filters, see screen.query
 	l.SetShowHelp(false)
+	l.SetShowStatusBar(false)
 	l.SetStatusBarItemName(singular, plural)
-	l.FilterInput.Prompt = "/ "
-	l.FilterInput.PromptStyle = l.Styles.FilterPrompt
-	l.FilterInput.Cursor.Style = l.Styles.FilterCursor
 	return l
 }
 
@@ -157,18 +195,41 @@ const (
 	screenForm
 )
 
-// screen is one step of the TUI: a filterable list with an optional details
-// pane, or an embedded huh form. The flow that pushes a screen supplies its
-// behavior through the callbacks.
+// command is one entry of the "/" popup.
+type command struct {
+	key  string
+	desc string
+	run  func(m *model) tea.Cmd
+}
+
+// popup is the open "/" command popup; the next keypress picks a command.
+type popup struct{ cmds []command }
+
+// screen is one step of the TUI: a type-to-filter list with an optional
+// details pane, or an embedded huh form. The flow that pushes a screen
+// supplies its behavior through the callbacks.
 type screen struct {
 	kind    screenKind
 	list    list.Model
 	form    *huh.Form
-	actions []key.Binding     // screen-specific keys, shown in the footer
 	details func(item) string // right pane content; nil hides the pane
 	empty   string            // hint shown instead of an empty list
 
-	// onKey handles a key the model did not; false passes it to the list.
+	all   []item // every row before filtering
+	query string // typed filter text
+	// build replaces the plain filter over all, for screens whose rows
+	// depend on the query (the dashboard's tree turns flat while filtering).
+	build func(query string) []item
+
+	// commands lists what the "/" popup offers right now; the model adds
+	// help and quit.
+	commands func(m *model) []command
+	// enterDesc names what enter does on the item, for the footer.
+	enterDesc func(item) string
+	hints     []key.Binding // extra footer hints
+
+	// onKey handles a key before it is typed into the query; false lets the
+	// model go on.
 	onKey func(m *model, msg tea.KeyMsg) (tea.Cmd, bool)
 	// onSubmit runs once a form completes, after its screen was popped.
 	onSubmit func(m *model) tea.Cmd
@@ -179,6 +240,59 @@ type screen struct {
 func (s *screen) selected() item {
 	it, _ := s.list.SelectedItem().(item)
 	return it
+}
+
+// refilter shows the rows matching the query.
+func (s *screen) refilter() tea.Cmd {
+	var rows []item
+	if s.build != nil {
+		rows = s.build(s.query)
+	} else {
+		rows = filterItems(s.all, s.query)
+	}
+	return s.list.SetItems(toListItems(rows))
+}
+
+// setItems replaces every row, keeping the query.
+func (s *screen) setItems(items []item) tea.Cmd {
+	s.all = items
+	return s.refilter()
+}
+
+// setQuery changes the filter; the selection moves to the top unless
+// keepSelection finds the previously selected row again.
+func (s *screen) setQuery(query string, keepSelection bool) tea.Cmd {
+	id := s.selected().id()
+	s.query = query
+	cmd := s.refilter()
+	s.list.Select(0)
+	if keepSelection {
+		s.selectID(id)
+	}
+	s.skipHeader(1)
+	return cmd
+}
+
+func (s *screen) selectID(id string) bool {
+	for i, li := range s.list.Items() {
+		if it, _ := li.(item); it.id() == id {
+			s.list.Select(i)
+			return true
+		}
+	}
+	return false
+}
+
+// skipHeader moves off a section header, which is not a real choice.
+func (s *screen) skipHeader(dir int) {
+	if s.selected().kind != itemHeader {
+		return
+	}
+	i := s.list.Index() + dir
+	if i < 0 || i >= len(s.list.Items()) {
+		i = s.list.Index() - dir
+	}
+	s.list.Select(i)
 }
 
 // formScreen wraps a form; onSubmit continues the flow once it completes.
@@ -273,11 +387,14 @@ type model struct {
 	width   int
 	height  int
 
+	collapsed map[string]bool // folders folded on the dashboard, by pathKey; session only
+
 	op         *operation
 	lastOpID   int
 	status     status
 	lastStID   int
 	confirming *confirmation // y/n question awaiting an answer
+	popup      *popup        // "/" command popup awaiting a key
 	quitting   bool
 	startup    tea.Cmd
 }
@@ -285,14 +402,14 @@ type model struct {
 func newModel(ctx context.Context, cfg *config.Config, vlt *vault.Client, tempDir *string, keyDir, version string) *model {
 	m := &model{
 		ctx: ctx, cfg: cfg, vlt: vlt, tempDir: tempDir, keyDir: keyDir, version: version,
-		keys: newKeyMap(),
-		help: help.New(),
+		keys:      newKeyMap(),
+		help:      help.New(),
+		collapsed: map[string]bool{},
 		spinner: spinner.New(
 			spinner.WithSpinner(spinner.Dot),
 			spinner.WithStyle(lipgloss.NewStyle().Foreground(ui.Accent))),
 	}
 	m.help.Styles = ui.HelpStyles()
-	m.keys.Pull.SetEnabled(vlt != nil)
 	return m
 }
 
@@ -425,6 +542,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if key.Matches(msg, m.keys.ForceQuit) {
 		return m.quit()
 	}
+	m.help.ShowAll = false // the full help lasts until the next key
 	s := m.top()
 	switch {
 	case s == nil:
@@ -437,6 +555,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return m.setStatus(statusInfo, "Cancelled.")
 		}
 		return nil
+	case m.popup != nil:
+		return m.popupKey(msg)
 	case s.form != nil:
 		// esc leaves the form unless the focused field uses it, as a
 		// multi-select does to end or clear its filter.
@@ -444,28 +564,82 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return m.back()
 		}
 		return m.updateForm(s, msg)
-	case s.list.SettingFilter():
-		return m.forward(msg) // typed text belongs to the filter
 	}
+	return m.listKey(s, msg)
+}
 
+// listKey routes a key on a list screen: "/" opens the popup, esc clears the
+// query or goes back, other printable text edits the query.
+func (m *model) listKey(s *screen, msg tea.KeyMsg) tea.Cmd {
 	switch {
+	case key.Matches(msg, m.keys.Commands):
+		m.popup = &popup{cmds: m.popupCommands(s)}
+		return nil
 	case key.Matches(msg, m.keys.Back):
-		if s.list.FilterState() == list.FilterApplied {
-			return m.forward(msg) // the list clears its filter
+		if s.query != "" {
+			return s.setQuery("", true)
 		}
 		return m.back()
-	case key.Matches(msg, m.keys.Quit):
-		return m.quit()
-	case key.Matches(msg, m.keys.Help):
-		m.help.ShowAll = !m.help.ShowAll
-		return nil
+	case key.Matches(msg, m.keys.Backspace) && s.query != "":
+		runes := []rune(s.query)
+		return s.setQuery(string(runes[:len(runes)-1]), false)
 	}
 	if s.onKey != nil {
 		if cmd, handled := s.onKey(m, msg); handled {
 			return cmd
 		}
 	}
-	return m.forward(msg)
+	if text, ok := typedText(msg); ok {
+		return s.setQuery(s.query+text, false)
+	}
+	cmd := m.forward(msg)
+	dir := 1
+	if slices.Contains([]string{"up", "pgup", "home"}, msg.String()) {
+		dir = -1
+	}
+	s.skipHeader(dir)
+	return cmd
+}
+
+// typedText reports the text a key press types; "/" never gets here.
+func typedText(msg tea.KeyMsg) (string, bool) {
+	switch {
+	case msg.Alt:
+		return "", false
+	case msg.Type == tea.KeySpace:
+		return " ", true
+	case msg.Type == tea.KeyRunes:
+		return string(msg.Runes), true
+	}
+	return "", false
+}
+
+// popupCommands is what the screen offers plus help and quit.
+func (m *model) popupCommands(s *screen) []command {
+	var cmds []command
+	if s.commands != nil {
+		cmds = s.commands(m)
+	}
+	return append(cmds,
+		command{"?", "full help", func(m *model) tea.Cmd { m.help.ShowAll = true; return nil }},
+		command{"q", "quit", func(m *model) tea.Cmd { return m.quit() }},
+	)
+}
+
+// popupKey runs the command bound to the key and closes the popup.
+func (m *model) popupKey(msg tea.KeyMsg) tea.Cmd {
+	p := m.popup
+	m.popup = nil
+	k := msg.String()
+	if k == "esc" || k == commandsKey {
+		return nil
+	}
+	for _, c := range p.cmds {
+		if c.key == k {
+			return c.run(m)
+		}
+	}
+	return m.setStatus(statusInfo, fmt.Sprintf("no shortcut %q", k))
 }
 
 // forward hands msg to the top screen's list or form.
@@ -575,8 +749,47 @@ func (m *model) View() string {
 		return ""
 	}
 	_, bodyH := m.bodySize()
+	body := m.bodyView(s, bodyH)
+	if m.popup != nil {
+		body = overlayCentered(body, m.popupView(), m.width)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left,
-		m.headerView(), m.bodyView(s, bodyH), m.statusView(), m.footerView())
+		m.headerView(), body, m.statusView(), m.footerView())
+}
+
+// popupView renders the command popup: aligned key and description rows.
+func (m *model) popupView() string {
+	keyWidth := 0
+	for _, c := range m.popup.cmds {
+		keyWidth = max(keyWidth, lipgloss.Width(c.key))
+	}
+	lines := []string{ui.TitleStyle.Render("Commands") + ui.MutedStyle.Render("  esc closes")}
+	for _, c := range m.popup.cmds {
+		pad := strings.Repeat(" ", keyWidth-lipgloss.Width(c.key))
+		lines = append(lines, ui.KeyStyle.Render(c.key)+pad+"  "+c.desc)
+	}
+	return ui.Popup(strings.Join(lines, "\n"))
+}
+
+// overlayCentered draws box over the middle of base, leaving the rest of base
+// visible around it.
+func overlayCentered(base, box string, width int) string {
+	baseLines := strings.Split(base, "\n")
+	boxLines := strings.Split(box, "\n")
+	boxWidth := lipgloss.Width(box)
+	top := max((len(baseLines)-len(boxLines))/2, 0)
+	left := max((width-boxWidth)/2, 0)
+	for i, boxLine := range boxLines {
+		y := top + i
+		if y >= len(baseLines) {
+			break
+		}
+		line := baseLines[y]
+		prefix := ansi.Truncate(line, left, "")
+		prefix += strings.Repeat(" ", max(left-lipgloss.Width(prefix), 0))
+		baseLines[y] = prefix + "\x1b[0m" + boxLine + "\x1b[0m" + ansi.TruncateLeft(line, left+boxWidth, "")
+	}
+	return strings.Join(baseLines, "\n")
 }
 
 func (m *model) headerView() string {
@@ -610,10 +823,18 @@ func (m *model) bodyView(s *screen, height int) string {
 	listW, detailsW := m.paneWidths(s)
 	innerW, _ := ui.PanelInnerSize(listW, height)
 	l := s.list // a copy, so the title is shortened for this frame only
-	l.Title = ellipsizeLeft(l.Title, innerW)
+	if s.query != "" {
+		l.Title = ellipsizeLeft(l.Title, max(innerW-lipgloss.Width(s.query)-4, 1)) + "  › " + s.query + "▏"
+	} else {
+		l.Title = ellipsizeLeft(l.Title, innerW)
+	}
 	content := l.View()
-	if len(l.Items()) == 0 && s.empty != "" {
-		content = ui.TitleStyle.Render(l.Title) + "\n\n" + ui.MutedStyle.Render(s.empty)
+	if len(l.Items()) == 0 {
+		hintText := s.empty
+		if s.query != "" {
+			hintText = "Nothing matches.\n\nesc clears the filter."
+		}
+		content = ui.TitleStyle.Render(l.Title) + "\n\n" + ui.MutedStyle.Render(hintText)
 	}
 	left := ui.Panel(content, listW, height, true)
 	if detailsW == 0 {
@@ -681,7 +902,8 @@ func (m *model) footerView() string {
 	return lipgloss.NewStyle().Padding(0, 1).Render(view)
 }
 
-// helpKeys returns the bindings that match what the current screen accepts.
+// helpKeys returns the bindings that match what the current screen accepts:
+// a minimal row, and the full columns for "/ ?".
 func (m *model) helpKeys() ([]key.Binding, [][]key.Binding) {
 	s := m.top()
 	var only []key.Binding
@@ -692,27 +914,39 @@ func (m *model) helpKeys() ([]key.Binding, [][]key.Binding) {
 		only = []key.Binding{m.keys.Yes, m.keys.No}
 	case m.op != nil && m.op.blocking:
 		only = []key.Binding{m.keys.Cancel, m.keys.ForceQuit}
+	case m.popup != nil:
+		only = []key.Binding{hint("key", "run command"), hint("esc", "close")}
 	case s.form != nil:
 		only = append(slices.Clone(s.form.KeyBinds()), m.keys.Back, m.keys.ForceQuit)
-	case s.list.SettingFilter():
-		only = []key.Binding{s.list.KeyMap.AcceptWhileFiltering, s.list.KeyMap.CancelWhileFiltering, m.keys.ForceQuit}
 	}
 	if only != nil {
 		return only, [][]key.Binding{only}
 	}
 
-	var general []key.Binding
-	if len(s.list.Items()) > 0 {
-		general = append(general, m.keys.Filter)
+	short := []key.Binding{hint("↑/↓", "move")}
+	if s.enterDesc != nil {
+		if it := s.selected(); it.kind != itemNone {
+			short = append(short, hint("enter", s.enterDesc(it)))
+		}
 	}
+	short = append(short, s.hints...)
+	short = append(short, hint("type", "to filter"), hint(commandsKey, "commands"))
 	switch {
-	case s.list.FilterState() == list.FilterApplied:
-		general = append(general, s.list.KeyMap.ClearFilter)
+	case s.query != "":
+		short = append(short, hint("esc", "clear filter"))
 	case len(m.stack) > 1:
-		general = append(general, m.keys.Back)
+		short = append(short, m.keys.Back)
 	}
-	general = append(general, m.keys.Help, m.keys.Quit)
-	short := append(slices.Clone(s.actions), general...)
-	nav := []key.Binding{m.keys.Up, m.keys.Down, s.list.KeyMap.PrevPage, s.list.KeyMap.NextPage}
-	return short, [][]key.Binding{nav, s.actions, general}
+
+	nav := []key.Binding{hint("↑/↓", "move"), hint("pgup/pgdn", "page")}
+	nav = append(nav, s.hints...)
+	nav = append(nav, hint("type", "to filter"), m.keys.Back, hint(commandsKey, "commands"))
+	var cmds []key.Binding
+	for _, c := range m.popupCommands(s) {
+		cmds = append(cmds, hint(commandsKey+" "+c.key, c.desc))
+	}
+	return short, [][]key.Binding{nav, cmds}
 }
+
+// pathKey joins a folder path into a map key and display string.
+func pathKey(path []string) string { return strings.Join(path, "/") }

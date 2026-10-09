@@ -186,3 +186,13 @@ func HuhTheme() *huh.Theme {
 	t.Help = HelpStyles()
 	return t
 }
+
+// Popup draws content in a small rounded box with the accent border, for
+// overlays such as the command popup.
+func Popup(content string) string {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(Accent).
+		Padding(0, 2).
+		Render(content)
+}
