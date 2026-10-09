@@ -14,10 +14,10 @@ import (
 
 // Palette tokens. Everything else in this package is derived from these.
 var (
-	// Accent marks the app title, focus, and key names.
-	Accent = lipgloss.AdaptiveColor{Light: "#5B4BC4", Dark: "#A496FF"}
+	// Accent is the neutral highlight (black on light terminals, white on dark) that marks the app title, focus, and key names.
+	Accent = lipgloss.AdaptiveColor{Light: "#000000", Dark: "#FFFFFF"}
 	// OnAccent is text drawn on an Accent background.
-	OnAccent = lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#16122B"}
+	OnAccent = lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#000000"}
 	// Text is regular foreground text.
 	Text = lipgloss.AdaptiveColor{Light: "#1F2328", Dark: "#E6E6E6"}
 	// Muted is secondary text: labels, hints, descriptions.
@@ -34,8 +34,6 @@ var (
 	Warning = lipgloss.AdaptiveColor{Light: "#9A6700", Dark: "#D29922"}
 	// Error marks failures.
 	Error = lipgloss.AdaptiveColor{Light: "#CF222E", Dark: "#F85149"}
-	// Highlight is the strongest neutral: black on light terminals, white on dark.
-	Highlight = lipgloss.AdaptiveColor{Light: "#000000", Dark: "#FFFFFF"}
 	// SelectionBg is the neutral grey background of the selected list row.
 	SelectionBg = lipgloss.AdaptiveColor{Light: "#E4E4E7", Dark: "#2A2A2E"}
 )
@@ -119,8 +117,8 @@ func ListItemStyles() list.DefaultItemStyles {
 	s.NormalTitle = lipgloss.NewStyle().Foreground(Text).Padding(0, 0, 0, 2)
 	s.SelectedTitle = lipgloss.NewStyle().
 		Border(lipgloss.ThickBorder(), false, false, false, true).
-		BorderForeground(Highlight).
-		Foreground(Highlight).
+		BorderForeground(Accent).
+		Foreground(Accent).
 		Background(SelectionBg).
 		Bold(true).
 		Padding(0, 0, 0, 1)
