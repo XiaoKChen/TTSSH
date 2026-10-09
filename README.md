@@ -5,6 +5,8 @@ your saved connections (in nested folders) and recent connections; pick an SSH k
 of the encrypted key vault — enter the target, then SSH in or copy files
 to/from the remote host without leaving the dashboard.
 
+![ttssh walkthrough: browsing saved folders, filtering, the / command popup, a new connection, editing a saved entry, settings, and help](docs/demo.gif)
+
 Works on Windows, macOS, and Linux. The terminal UI is built into the binary,
 so the only external requirement is the standard `ssh`/`scp` client
 (preinstalled on macOS/Linux, and included with Windows 10+ as the built-in
@@ -124,6 +126,7 @@ path instead.
 | | `/` `n` | new connection |
 | | `/` `u` / `/` `d` | upload / download a file |
 | | `/` `a` | save a recent into a folder |
+| | `/` `e` | edit a saved connection (username, host, key) |
 | | `/` `m` | move a connection or folder |
 | | `/` `f` / `/` `r` | new folder / rename folder |
 | | `/` `x` | remove connection or recent, delete folder (`y` confirms) |
@@ -226,6 +229,7 @@ internal/config/   persistent settings (config.json), recents, saved folder tree
 internal/ui/       color palette, shared styles, huh theme, print helpers
 internal/vault/    key-vault client: Turso/libSQL access and v1 decryption
                    (plus the crypto interop tests)
+docs/              README assets (demo.gif)
 ```
 
 ## Building
