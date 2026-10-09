@@ -534,6 +534,8 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		return msg.apply(m)
 	case execDoneMsg:
 		return m.execDone(msg)
+	case configEditedMsg:
+		return m.reloadConfig(msg.err)
 	}
 	return m.forward(msg)
 }

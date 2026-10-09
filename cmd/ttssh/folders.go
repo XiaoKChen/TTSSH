@@ -320,7 +320,9 @@ func dashboardCommands(m *model) []command {
 			return nil
 		}})
 	}
-	return cmds
+	return append(cmds,
+		command{"c", "edit settings", func(m *model) tea.Cmd { return m.editSettings() }},
+		command{"C", "open config.json in your editor", func(m *model) tea.Cmd { return m.editConfigFile() }})
 }
 
 func clearRecents(m *model) tea.Cmd {

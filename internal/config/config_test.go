@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -315,3 +317,45 @@ func TestConfigJSON(t *testing.T) {
 		}
 	})
 }
+
+func TestRead(t *testing.T) {
+	tests := []struct {
+		name    string
+		content *string // nil leaves the file missing
+		want    Config
+		wantErr bool
+	}{
+		{"parses a valid file", ptr(`{"key_dir": "/k"}`), Config{KeyDir: "/k"}, false},
+		{"rejects invalid JSON", ptr(`{"key_dir": `), Config{}, true},
+		{"rejects a missing file", nil, Config{}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("AppData", dir)
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			t.Setenv("HOME", dir)
+			if tc.content != nil {
+				path, err := Path()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(*tc.content), filePerm); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := Read()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Read() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }

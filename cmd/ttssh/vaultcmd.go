@@ -30,6 +30,14 @@ func connectVault(cfg config.Config) (*vault.Client, error) {
 	return vault.Open(vc)
 }
 
+// reconnectVault replaces the vault client after the settings changed; a
+// failed connect leaves the vault off so stale credentials are not used.
+func (m *model) reconnectVault() error {
+	vlt, err := connectVault(*m.cfg)
+	m.vlt = vlt
+	return err
+}
+
 // ---- session temp keys ----
 
 // Permissions for the session-only decrypted key material: keyDirPerm on the
@@ -362,6 +370,32 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 	return nil
 }
 
+const masterKeyHexLen = 64
+
+func validateVaultURL(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("required")
+	}
+	if !strings.HasPrefix(s, "libsql://") && !strings.HasPrefix(s, "https://") && !strings.HasPrefix(s, "http://") {
+		return errors.New("must start with libsql:// or https://")
+	}
+	return nil
+}
+
+func validateMasterKeyHex(s string) error {
+	s = strings.TrimSpace(s)
+	if len(s) != masterKeyHexLen {
+		return fmt.Errorf("must be exactly %d hex characters", masterKeyHexLen)
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return errors.New("must be hex")
+		}
+	}
+	return nil
+}
+
 // vaultSetup interactively collects and persists vault credentials. Secrets
 // land in config.json in plain text (same trust level as the uploader's
 // .env); prefer environment variables if that is a concern.
@@ -373,33 +407,13 @@ func vaultSetup(ctx context.Context, cfg *config.Config) error {
 		huh.NewInput().Title("Database URL").
 			Description("libsql://… or https://… (the uploader's DB_URL)").
 			Placeholder("libsql://your-db.turso.io").
-			Validate(func(s string) error {
-				s = strings.TrimSpace(s)
-				if s == "" {
-					return errors.New("required")
-				}
-				if !strings.HasPrefix(s, "libsql://") && !strings.HasPrefix(s, "https://") && !strings.HasPrefix(s, "http://") {
-					return errors.New("must start with libsql:// or https://")
-				}
-				return nil
-			}).Value(&url),
+			Validate(validateVaultURL).Value(&url),
 		huh.NewInput().Title("Auth token (DB_TOKEN)").
 			EchoMode(huh.EchoModePassword).
 			Value(&token),
 		huh.NewInput().Title("Master key (MASTER_KEY_V1_HEX, 64 hex chars)").
 			EchoMode(huh.EchoModePassword).
-			Validate(func(s string) error {
-				s = strings.TrimSpace(s)
-				if len(s) != 64 {
-					return errors.New("must be exactly 64 hex characters")
-				}
-				for _, c := range s {
-					if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
-						return errors.New("must be hex")
-					}
-				}
-				return nil
-			}).Value(&masterHex),
+			Validate(validateMasterKeyHex).Value(&masterHex),
 		huh.NewInput().Title("Private CA certificate path (optional)").
 			Description("Leave empty unless the server uses a private CA").
 			Value(&caCert),

@@ -76,6 +76,14 @@ Dashboard commands (after `/`):
 - **x** — remove the selected connection or recent, or delete a folder with
   everything in it (asks y/n first, stating how many connections it holds).
 - **X** — clear every recent connection (asks y/n first).
+- **c** — edit settings: key folder and the vault connection (URL, token,
+  master key, CA certificate). Token and master key are masked. Saved to
+  `config.json` on submit; `esc` cancels. The vault reconnects if its settings
+  changed.
+- **C** — open `config.json` in your editor (`$VISUAL`, else `$EDITOR`, else
+  `notepad` on Windows / `vi` elsewhere; arguments such as `code --wait` work).
+  When the editor exits the file is reloaded. If it is not valid JSON, ttssh
+  keeps the current settings, shows the error, and leaves your file untouched.
 - **?** — full help, **q** — quit.
 
 `enter` on a connection or recent runs SSH (`ssh -i <key> user@host`); the
@@ -120,6 +128,7 @@ path instead.
 | | `/` `f` / `/` `r` | new folder / rename folder |
 | | `/` `x` | remove connection or recent, delete folder (`y` confirms) |
 | | `/` `X` | clear all recents (`y` confirms) |
+| | `/` `c` / `/` `C` | edit settings / open config.json in your editor |
 | | `/` `?` / `/` `q` | full help / quit |
 | Key picker | `enter` | use the selected key (or password login) |
 | | `/` `f` | change the key folder |

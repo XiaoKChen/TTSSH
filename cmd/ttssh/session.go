@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/huh"
 
 	"ttssh/internal/config"
 	"ttssh/internal/ui"
@@ -293,4 +295,141 @@ func splitLines(s string) []string {
 		}
 	}
 	return out
+}
+
+// ---- settings and config.json ----
+
+const (
+	visualEnv        = "VISUAL"
+	editorEnv        = "EDITOR"
+	windowsEditor    = "notepad"
+	unixEditor       = "vi"
+	configEditedNote = "Opening config.json — save and quit the editor to return."
+)
+
+// configEditedMsg reports that the editor launched by "/ C" exited.
+type configEditedMsg struct{ err error }
+
+// editorCommand is the editor command line: $VISUAL, else $EDITOR (either may
+// carry arguments, like "code --wait"), else a platform default.
+func editorCommand() []string {
+	for _, env := range []string{visualEnv, editorEnv} {
+		if fields := strings.Fields(os.Getenv(env)); len(fields) > 0 {
+			return fields
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return []string{windowsEditor}
+	}
+	return []string{unixEditor}
+}
+
+// settingsChanged follows up a change of the settings fields: it re-derives
+// the key folder, reconnects the vault if its settings changed, and shows
+// okMsg (with a warning when the vault cannot be opened).
+func (m *model) settingsChanged(old config.Config, okMsg string) tea.Cmd {
+	if m.cfg.KeyDir != old.KeyDir {
+		m.keyDir = config.ResolveKeyDir("", *m.cfg)
+	}
+	refresh := m.refreshDashboard("")
+	if m.cfg.Vault != old.Vault {
+		if err := m.reconnectVault(); err != nil {
+			return tea.Batch(refresh, m.setStatus(statusWarn, okMsg+" Vault not connected: "+err.Error()))
+		}
+	}
+	return tea.Batch(refresh, m.setStatus(statusSuccess, okMsg))
+}
+
+// editSettings edits the key folder and vault settings. The token and master
+// key are masked, like in 'ttssh vault setup'.
+func (m *model) editSettings() tea.Cmd {
+	old := *m.cfg
+	keyDir := old.KeyDir
+	vc := old.Vault
+	form := newForm(huh.NewGroup(
+		huh.NewInput().Title("Key folder").
+			Description("Scanned for *.key files; empty means ~/.ssh").
+			Validate(validateKeyDir).Value(&keyDir),
+		huh.NewInput().Title("Vault database URL").
+			Description("Empty turns the vault off").
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" {
+					return nil
+				}
+				return validateVaultURL(s)
+			}).Value(&vc.URL),
+		huh.NewInput().Title("Vault auth token").
+			EchoMode(huh.EchoModePassword).Value(&vc.Token),
+		huh.NewInput().Title("Vault master key (64 hex chars)").
+			EchoMode(huh.EchoModePassword).
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" && strings.TrimSpace(vc.URL) == "" {
+					return nil
+				}
+				return validateMasterKeyHex(s)
+			}).Value(&vc.MasterKeyHex),
+		huh.NewInput().Title("Vault private CA certificate path").
+			Description("Optional").Value(&vc.CACert),
+	).Title("Settings"))
+	return m.push(formScreen(form, func(m *model) tea.Cmd {
+		m.cfg.KeyDir = strings.TrimSpace(keyDir)
+		m.cfg.Vault = config.VaultConfig{
+			URL:          strings.TrimSpace(vc.URL),
+			Token:        strings.TrimSpace(vc.Token),
+			MasterKeyHex: strings.TrimSpace(vc.MasterKeyHex),
+			CACert:       strings.TrimSpace(vc.CACert),
+		}
+		if err := m.cfg.Save(); err != nil {
+			return tea.Batch(m.settingsChanged(old, "Settings changed for this session."),
+				m.setStatus(statusError, "Changed for this session, but saving failed: "+err.Error()))
+		}
+		return m.settingsChanged(old, "Settings saved.")
+	}))
+}
+
+// validateKeyDir accepts an empty value (the default) or an existing folder.
+func validateKeyDir(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	info, err := os.Stat(config.ExpandHome(s))
+	switch {
+	case err != nil:
+		return errors.New("folder not found")
+	case !info.IsDir():
+		return errors.New("not a folder")
+	}
+	return nil
+}
+
+// editConfigFile suspends the TUI to edit config.json. The current state is
+// saved first so the editor opens an up-to-date file.
+func (m *model) editConfigFile() tea.Cmd {
+	path, err := config.Path()
+	if err != nil {
+		return m.setStatus(statusError, "locating config.json: "+err.Error())
+	}
+	if err := m.cfg.Save(); err != nil {
+		return m.setStatus(statusError, "saving config.json before editing: "+err.Error())
+	}
+	argv := append(editorCommand(), path)
+	c := terminalCmd{exec.CommandContext(m.ctx, argv[0], argv[1:]...)}
+	return tea.Batch(m.setStatus(statusInfo, configEditedNote),
+		tea.Exec(c, func(err error) tea.Msg { return configEditedMsg{err: err} }))
+}
+
+// reloadConfig applies config.json after the editor exited. A file that no
+// longer parses is left as the user wrote it and the current config is kept.
+func (m *model) reloadConfig(editorErr error) tea.Cmd {
+	if editorErr != nil {
+		return m.setStatus(statusError, "running the editor: "+editorErr.Error()+" (config not reloaded)")
+	}
+	next, err := config.Read()
+	if err != nil {
+		return m.setStatus(statusError, "config.json not reloaded, keeping current settings: "+err.Error())
+	}
+	old := *m.cfg
+	*m.cfg = next
+	return m.settingsChanged(old, "Reloaded config.json.")
 }

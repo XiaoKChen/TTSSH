@@ -108,6 +108,24 @@ func Load() Config {
 	return cfg
 }
 
+// Read loads the config strictly: unlike Load, a missing file or invalid JSON
+// is an error, so callers can keep what they have instead of resetting.
+func Read() (Config, error) {
+	path, err := Path()
+	if err != nil {
+		return Config{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
 const (
 	dirPerm  = 0o755
 	filePerm = 0o644

@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -504,6 +507,154 @@ func TestEditConnection(t *testing.T) {
 			}
 			if m.status.text != tc.wantStatus {
 				t.Errorf("status = %q, want %q", m.status.text, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestEditSettings(t *testing.T) {
+	keyDir := t.TempDir()
+	masterKey := strings.Repeat("ab", 32)
+	tests := []struct {
+		name       string
+		keys       []string
+		wantCfg    config.Config
+		wantVault  bool
+		wantStatus string
+		wantScreen int
+	}{
+		{
+			name:       "saves the key folder",
+			keys:       []string{"/", "c", keyDir, "enter", "enter", "enter", "enter", "enter"},
+			wantCfg:    config.Config{KeyDir: keyDir},
+			wantStatus: "Settings saved.",
+			wantScreen: 1,
+		},
+		{
+			name:       "saves vault settings and connects",
+			keys:       []string{"/", "c", "enter", "https://vault.example", "enter", "tok", "enter", masterKey, "enter", "enter"},
+			wantCfg:    config.Config{Vault: config.VaultConfig{URL: "https://vault.example", Token: "tok", MasterKeyHex: masterKey}},
+			wantVault:  true,
+			wantStatus: "Settings saved.",
+			wantScreen: 1,
+		},
+		{
+			name:       "esc changes nothing",
+			keys:       []string{"/", "c", keyDir, "esc"},
+			wantScreen: 1,
+		},
+		{
+			name:       "a missing key folder is rejected inline",
+			keys:       []string{"/", "c", filepath.Join(keyDir, "nope"), "enter"},
+			wantScreen: 2,
+		},
+		{
+			name:       "a bad vault URL is rejected inline",
+			keys:       []string{"/", "c", "enter", "ftp://x", "enter"},
+			wantScreen: 2,
+		},
+		{
+			name:       "a vault URL without a master key is rejected",
+			keys:       []string{"/", "c", "enter", "https://vault.example", "enter", "enter", "enter"},
+			wantScreen: 2,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(t, nil)
+			press(m, tc.keys...)
+			if !reflect.DeepEqual(*m.cfg, tc.wantCfg) {
+				t.Errorf("cfg = %+v, want %+v", *m.cfg, tc.wantCfg)
+			}
+			if (m.vlt != nil) != tc.wantVault {
+				t.Errorf("vault connected = %v, want %v", m.vlt != nil, tc.wantVault)
+			}
+			if m.status.text != tc.wantStatus {
+				t.Errorf("status = %q, want %q", m.status.text, tc.wantStatus)
+			}
+			if len(m.stack) != tc.wantScreen {
+				t.Errorf("screens = %d, want %d", len(m.stack), tc.wantScreen)
+			}
+			saved, err := config.Read()
+			if tc.wantStatus == "" {
+				if err == nil {
+					t.Errorf("config.json was written: %+v", saved)
+				}
+			} else if err != nil || !reflect.DeepEqual(saved, tc.wantCfg) {
+				t.Errorf("saved = %+v (err %v), want %+v", saved, err, tc.wantCfg)
+			}
+		})
+	}
+}
+
+func TestReloadAfterEdit(t *testing.T) {
+	const validJSON = `{"key_dir": "/elsewhere", "recents": [{"user": "u", "host": "h", "key": ""}]}`
+	tests := []struct {
+		name       string
+		file       string
+		editorErr  error
+		wantKeyDir string
+		wantErr    bool
+		wantStatus string
+	}{
+		{"applies a valid file", validJSON, nil, "/elsewhere", false, "Reloaded config.json."},
+		{"keeps the config on invalid JSON", `{"key_dir": `, nil, "/before", true, "config.json not reloaded"},
+		{"keeps the config when the editor fails", validJSON, errors.New("boom"), "/before", true, "running the editor"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModelConfig(t, config.Config{KeyDir: "/before", Recents: sampleRecents()})
+			path, err := config.Path()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.file), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			m.Update(configEditedMsg{err: tc.editorErr})
+			if m.cfg.KeyDir != tc.wantKeyDir {
+				t.Errorf("KeyDir = %q, want %q", m.cfg.KeyDir, tc.wantKeyDir)
+			}
+			if wantRecents := map[bool]int{true: len(sampleRecents()), false: 1}[tc.wantErr]; len(m.cfg.Recents) != wantRecents {
+				t.Errorf("recents = %d, want %d", len(m.cfg.Recents), wantRecents)
+			}
+			if (m.status.kind == statusError) != tc.wantErr || !strings.HasPrefix(m.status.text, tc.wantStatus) {
+				t.Errorf("status = %v %q, want error=%v prefix %q", m.status.kind, m.status.text, tc.wantErr, tc.wantStatus)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != tc.file {
+				t.Errorf("file = %q (err %v), want it left as %q", data, err, tc.file)
+			}
+		})
+	}
+}
+
+func TestEditorCommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		visual, editor string
+		want           []string
+	}{
+		{"VISUAL wins", "code --wait", "nano", []string{"code", "--wait"}},
+		{"EDITOR is next", "", "nano -w", []string{"nano", "-w"}},
+		{"blank values fall back to the default", "  ", "", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(visualEnv, tc.visual)
+			t.Setenv(editorEnv, tc.editor)
+			got := editorCommand()
+			if tc.want == nil {
+				tc.want = []string{unixEditor}
+				if runtime.GOOS == "windows" {
+					tc.want = []string{windowsEditor}
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("editorCommand() = %v, want %v", got, tc.want)
 			}
 		})
 	}
