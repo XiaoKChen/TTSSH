@@ -40,6 +40,15 @@ const (
 	keyFilePerm = 0o600
 )
 
+// Session keys live in ~/.ssh/tmp/ttssh-vault-*, not the system temp dir:
+// on Windows chmod does not touch ACLs, so key files inherit their folder's
+// ACL, and OpenSSH rejects keys that anyone else can read. %TEMP% often
+// grants extra groups access, while ~/.ssh is normally private to the user.
+const (
+	sessionKeyParent    = "tmp"
+	sessionKeyDirPrefix = "ttssh-vault-"
+)
+
 // writeSessionKey writes unitID's decrypted key to the session temp
 // directory. *tempDir holds that directory's path across calls so the temp
 // dir is created at most once per run; the caller (main) owns it and is
@@ -47,7 +56,15 @@ const (
 // the key in a tea.Cmd and calls this only from Update.
 func writeSessionKey(tempDir *string, unitID string, key []byte) (string, error) {
 	if *tempDir == "" {
-		dir, err := os.MkdirTemp("", "ttssh-vault-")
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("locating home directory: %w", err)
+		}
+		parent := filepath.Join(home, ".ssh", sessionKeyParent)
+		if err := os.MkdirAll(parent, keyDirPerm); err != nil {
+			return "", fmt.Errorf("creating %s: %w", parent, err)
+		}
+		dir, err := os.MkdirTemp(parent, sessionKeyDirPrefix)
 		if err != nil {
 			return "", fmt.Errorf("creating session key dir: %w", err)
 		}
@@ -69,6 +86,9 @@ func writeSessionKey(tempDir *string, unitID string, key []byte) (string, error)
 func cleanupVaultTemp(tempDir *string) {
 	if *tempDir != "" {
 		_ = os.RemoveAll(*tempDir) // best-effort cleanup on exit
+		// Best-effort: drops ~/.ssh/tmp only when empty, so another running
+		// ttssh's keys (or the user's own files) are left alone.
+		_ = os.Remove(filepath.Dir(*tempDir))
 		*tempDir = ""
 	}
 }

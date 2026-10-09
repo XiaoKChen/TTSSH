@@ -143,7 +143,10 @@ is read-only against the vault.
 When the vault is configured, the key picker lists every stored unit as a
 `☁ unit-id` entry next to your local `*.key` files (with fingerprint, creation
 date, and status in the details pane; revoked units are marked `(revoked)`). Picking one decrypts the key to a
-private temp file used just for that session and deleted when ttssh exits.
+private temp file under `~/.ssh/tmp/` used just for that session and deleted
+when ttssh exits. (It lives in `~/.ssh` rather than the system temp folder
+because OpenSSH refuses keys that other accounts can read, and on Windows the
+temp folder often grants extra groups access.)
 Vault keys also work from the recents list — they are re-fetched on use, so
 no key material is persisted between runs.
 
