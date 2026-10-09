@@ -19,19 +19,23 @@ import (
 	"ttssh/internal/vault"
 )
 
-// connectVault opens the vault if it is configured; a misconfigured vault
-// warns and returns nil so the local-keys flow keeps working.
-func connectVault(cfg config.Config) *vault.Client {
+// connectVault opens the vault if it is configured. It returns nil, nil when
+// no vault is configured; on a misconfigured vault the caller warns and the
+// local-keys flow keeps working.
+func connectVault(cfg config.Config) (*vault.Client, error) {
 	vc := vault.ResolveConfig(cfg)
 	if !vc.Configured() {
-		return nil
+		return nil, nil
 	}
-	v, err := vault.Open(vc)
-	if err != nil {
-		ui.PrintWarn("vault: " + err.Error())
-		return nil
-	}
-	return v
+	return vault.Open(vc)
+}
+
+// reconnectVault replaces the vault client after the settings changed; a
+// failed connect leaves the vault off so stale credentials are not used.
+func (m *model) reconnectVault() error {
+	vlt, err := connectVault(*m.cfg)
+	m.vlt = vlt
+	return err
 }
 
 // ---- session temp keys ----
@@ -44,17 +48,31 @@ const (
 	keyFilePerm = 0o600
 )
 
-// materializeVaultKey fetches and decrypts unitID, writing it to a session
-// temp directory. *tempDir holds that directory's path across calls so the
-// temp dir is created at most once per run; the caller (main) owns it and is
-// responsible for calling cleanupVaultTemp on exit.
-func materializeVaultKey(ctx context.Context, v *vault.Client, unitID string, tempDir *string) (string, error) {
-	key, err := v.FetchKey(ctx, unitID)
-	if err != nil {
-		return "", err
-	}
+// Session keys live in ~/.ssh/tmp/ttssh-vault-*, not the system temp dir:
+// on Windows chmod does not touch ACLs, so key files inherit their folder's
+// ACL, and OpenSSH rejects keys that anyone else can read. %TEMP% often
+// grants extra groups access, while ~/.ssh is normally private to the user.
+const (
+	sessionKeyParent    = "tmp"
+	sessionKeyDirPrefix = "ttssh-vault-"
+)
+
+// writeSessionKey writes unitID's decrypted key to the session temp
+// directory. *tempDir holds that directory's path across calls so the temp
+// dir is created at most once per run; the caller (main) owns it and is
+// responsible for calling cleanupVaultTemp on exit. The dashboard fetches
+// the key in a tea.Cmd and calls this only from Update.
+func writeSessionKey(tempDir *string, unitID string, key []byte) (string, error) {
 	if *tempDir == "" {
-		dir, err := os.MkdirTemp("", "ttssh-vault-")
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("locating home directory: %w", err)
+		}
+		parent := filepath.Join(home, ".ssh", sessionKeyParent)
+		if err := os.MkdirAll(parent, keyDirPerm); err != nil {
+			return "", fmt.Errorf("creating %s: %w", parent, err)
+		}
+		dir, err := os.MkdirTemp(parent, sessionKeyDirPrefix)
 		if err != nil {
 			return "", fmt.Errorf("creating session key dir: %w", err)
 		}
@@ -76,6 +94,9 @@ func materializeVaultKey(ctx context.Context, v *vault.Client, unitID string, te
 func cleanupVaultTemp(tempDir *string) {
 	if *tempDir != "" {
 		_ = os.RemoveAll(*tempDir) // best-effort cleanup on exit
+		// Best-effort: drops ~/.ssh/tmp only when empty, so another running
+		// ttssh's keys (or the user's own files) are left alone.
+		_ = os.Remove(filepath.Dir(*tempDir))
 		*tempDir = ""
 	}
 }
@@ -98,21 +119,13 @@ func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string)
 		return nil
 	}
 
-	opts := make([]huh.Option[string], 0, len(units))
-	for _, u := range units {
-		label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
-		if u.Revoked() {
-			label += "  (revoked)"
-		}
-		opts = append(opts, huh.NewOption(label, u.UnitID))
-	}
 	var selected []string
 	err = huh.NewMultiSelect[string]().
 		Title("Download which keys?").
 		Description("Space toggles · a toggles all · Enter confirms").
-		Options(opts...).
+		Options(unitOptions(units)...).
 		Value(&selected).
-		WithTheme(huh.ThemeCharm()).
+		WithTheme(ui.HuhTheme()).
 		Run()
 	if err != nil {
 		return err
@@ -123,36 +136,62 @@ func vaultPullInteractive(ctx context.Context, v *vault.Client, startDir string)
 	}
 
 	ui.PrintNote("Where should the keys be saved?")
-	dir, err := browseDir(startDir)
+	dir, err := browseDir(ctx, startDir)
 	if err != nil {
 		return err
 	}
 
-	saved, err := saveVaultKeys(ctx, v, selected, dir, confirmOverwrite)
+	saved, err := saveVaultKeys(ctx, v, selected, dir, confirmOverwrite, cliNotifier())
 	if saved > 0 {
 		ui.PrintSuccess(fmt.Sprintf("Saved %d key file(s) to %s", saved, dir))
 	}
 	return err
 }
 
-// confirmOverwrite asks before replacing an existing file (interactive flow).
-func confirmOverwrite(dest string) (bool, error) {
-	ok := false
-	err := huh.NewConfirm().
+// unitOptions lists vault units for a multi-select, marking revoked ones.
+func unitOptions(units []vault.Unit) []huh.Option[string] {
+	opts := make([]huh.Option[string], 0, len(units))
+	for _, u := range units {
+		label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
+		if u.Revoked() {
+			label += "  (revoked)"
+		}
+		opts = append(opts, huh.NewOption(label, u.UnitID))
+	}
+	return opts
+}
+
+// overwriteConfirm asks before replacing the existing file dest.
+func overwriteConfirm(dest string, ok *bool) *huh.Confirm {
+	return huh.NewConfirm().
 		Title(filepath.Base(dest) + " already exists — overwrite?").
 		Description(dest).
 		Affirmative("Overwrite").
 		Negative("Skip").
-		Value(&ok).
-		WithTheme(huh.ThemeCharm()).
-		Run()
+		Value(ok)
+}
+
+// confirmOverwrite asks before replacing an existing file (interactive flow).
+func confirmOverwrite(dest string) (bool, error) {
+	ok := false
+	err := overwriteConfirm(dest, &ok).WithTheme(ui.HuhTheme()).Run()
 	return ok, err
+}
+
+// saveNotifier receives saveVaultKeys' per-file messages: the CLI prints
+// them, the dashboard collects them for its status line.
+type saveNotifier struct {
+	saved, skipped, failed func(msg string)
+}
+
+func cliNotifier() saveNotifier {
+	return saveNotifier{saved: ui.PrintSuccess, skipped: ui.PrintNote, failed: ui.PrintWarn}
 }
 
 // saveVaultKeys fetches, decrypts, and writes each unit to dir as
 // <unit>.key (0600). onConflict decides what happens to existing files;
 // nil means "refuse". Returns how many files were written.
-func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error)) (int, error) {
+func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir string, onConflict func(string) (bool, error), notify saveNotifier) (int, error) {
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
 		return 0, fmt.Errorf("destination folder %s does not exist", dir)
@@ -162,7 +201,7 @@ func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir s
 		dest := filepath.Join(dir, id+".key")
 		if _, err := os.Stat(dest); err == nil {
 			if onConflict == nil {
-				ui.PrintWarn(dest + " already exists — skipping (use -force to overwrite)")
+				notify.failed(dest + " already exists — skipping (use -force to overwrite)")
 				continue
 			}
 			ok, err := onConflict(dest)
@@ -170,19 +209,19 @@ func saveVaultKeys(ctx context.Context, v *vault.Client, unitIDs []string, dir s
 				return saved, err
 			}
 			if !ok {
-				ui.PrintNote("Skipped " + id + ".")
+				notify.skipped("Skipped " + id + ".")
 				continue
 			}
 		}
 		key, err := v.FetchKey(ctx, id)
 		if err != nil {
-			ui.PrintWarn(err.Error())
+			notify.failed(err.Error())
 			continue
 		}
 		if err := os.WriteFile(dest, key, keyFilePerm); err != nil {
 			return saved, fmt.Errorf("writing %s: %w", dest, err)
 		}
-		ui.PrintSuccess("Saved " + dest)
+		notify.saved("Saved " + dest)
 		saved++
 	}
 	return saved, nil
@@ -294,19 +333,11 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 		if err != nil {
 			return fmt.Errorf("listing vault keys: %w", err)
 		}
-		opts := make([]huh.Option[string], 0, len(units))
-		for _, u := range units {
-			label := fmt.Sprintf("%-24s  %s", u.UnitID, u.Fingerprint)
-			if u.Revoked() {
-				label += "  (revoked)"
-			}
-			opts = append(opts, huh.NewOption(label, u.UnitID))
-		}
 		if err := huh.NewMultiSelect[string]().
 			Title("Download which keys?").
-			Options(opts...).
+			Options(unitOptions(units)...).
 			Value(&ids).
-			WithTheme(huh.ThemeCharm()).
+			WithTheme(ui.HuhTheme()).
 			Run(); err != nil {
 			return err
 		}
@@ -319,7 +350,7 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 	dir := config.ExpandHome(out)
 	if dir == "" {
 		var err error
-		if dir, err = browseDir(config.ResolveKeyDir("", *cfg)); err != nil {
+		if dir, err = browseDir(ctx, config.ResolveKeyDir("", *cfg)); err != nil {
 			return err
 		}
 	}
@@ -328,7 +359,7 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 	if !force {
 		onConflict = nil // refuse, with a hint
 	}
-	saved, err := saveVaultKeys(ctx, v, ids, dir, onConflict)
+	saved, err := saveVaultKeys(ctx, v, ids, dir, onConflict, cliNotifier())
 	if err != nil {
 		return err
 	}
@@ -336,6 +367,32 @@ func vaultPull(ctx context.Context, cfg *config.Config, v *vault.Client, ids []s
 		return errors.New("no files were written")
 	}
 	fmt.Printf("saved %d key file(s) to %s\n", saved, dir)
+	return nil
+}
+
+const masterKeyHexLen = 64
+
+func validateVaultURL(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New("required")
+	}
+	if !strings.HasPrefix(s, "libsql://") && !strings.HasPrefix(s, "https://") && !strings.HasPrefix(s, "http://") {
+		return errors.New("must start with libsql:// or https://")
+	}
+	return nil
+}
+
+func validateMasterKeyHex(s string) error {
+	s = strings.TrimSpace(s)
+	if len(s) != masterKeyHexLen {
+		return fmt.Errorf("must be exactly %d hex characters", masterKeyHexLen)
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return errors.New("must be hex")
+		}
+	}
 	return nil
 }
 
@@ -350,37 +407,17 @@ func vaultSetup(ctx context.Context, cfg *config.Config) error {
 		huh.NewInput().Title("Database URL").
 			Description("libsql://… or https://… (the uploader's DB_URL)").
 			Placeholder("libsql://your-db.turso.io").
-			Validate(func(s string) error {
-				s = strings.TrimSpace(s)
-				if s == "" {
-					return errors.New("required")
-				}
-				if !strings.HasPrefix(s, "libsql://") && !strings.HasPrefix(s, "https://") && !strings.HasPrefix(s, "http://") {
-					return errors.New("must start with libsql:// or https://")
-				}
-				return nil
-			}).Value(&url),
+			Validate(validateVaultURL).Value(&url),
 		huh.NewInput().Title("Auth token (DB_TOKEN)").
 			EchoMode(huh.EchoModePassword).
 			Value(&token),
 		huh.NewInput().Title("Master key (MASTER_KEY_V1_HEX, 64 hex chars)").
 			EchoMode(huh.EchoModePassword).
-			Validate(func(s string) error {
-				s = strings.TrimSpace(s)
-				if len(s) != 64 {
-					return errors.New("must be exactly 64 hex characters")
-				}
-				for _, c := range s {
-					if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
-						return errors.New("must be hex")
-					}
-				}
-				return nil
-			}).Value(&masterHex),
+			Validate(validateMasterKeyHex).Value(&masterHex),
 		huh.NewInput().Title("Private CA certificate path (optional)").
 			Description("Leave empty unless the server uses a private CA").
 			Value(&caCert),
-	)).WithTheme(huh.ThemeCharm())
+	)).WithTheme(ui.HuhTheme())
 	if err := form.Run(); err != nil {
 		return err
 	}

@@ -9,8 +9,8 @@ import (
 	"os"
 	"runtime/debug"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
-	"github.com/ktr0731/go-fuzzyfinder"
 
 	"ttssh/internal/config"
 	"ttssh/internal/ui"
@@ -42,10 +42,11 @@ func main() {
 	cfg := config.Load()
 	ver := resolveVersion()
 
-	// A background root context: the huh/fuzzyfinder prompts already treat
-	// Ctrl+C as an abort, and an interactive ssh/scp session must receive
-	// Ctrl+C itself rather than have it kill the child process via context
-	// cancellation. No signal.NotifyContext here, intentionally.
+	// A background root context: the Bubble Tea UI and huh prompts read
+	// Ctrl+C as a key (the terminal is in raw mode), and while ssh/scp run
+	// via tea.Exec Bubble Tea ignores SIGINT, so an interactive session
+	// receives Ctrl+C itself rather than have it kill the child process via
+	// context cancellation. No signal.NotifyContext here, intentionally.
 	ctx := context.Background()
 	var vaultTempDir string
 
@@ -87,13 +88,10 @@ func main() {
 	}
 
 	defer cleanupVaultTemp(&vaultTempDir)
-	if err := run(ctx, &cfg, config.ResolveKeyDir(*keyDirFlag, cfg), &vaultTempDir, ver); err != nil {
-		if isAbort(err) {
-			ui.PrintNote("Bye!")
-			return
-		}
+	if err := run(ctx, &cfg, config.ResolveKeyDir(*keyDirFlag, cfg), &vaultTempDir, ver); err != nil && !isAbort(err) {
 		fatal(&vaultTempDir, "%v", err)
 	}
+	ui.PrintNote("Bye!")
 }
 
 func usage() {
@@ -113,31 +111,11 @@ Flags:
 	flag.PrintDefaults()
 }
 
-// isAbort reports whether the user backed out (Esc / Ctrl+C) of a prompt.
+// isAbort reports whether the user backed out (Esc / Ctrl+C) of a prompt or
+// the folder browser, or the UI was interrupted by SIGINT.
 func isAbort(err error) bool {
-	return errors.Is(err, huh.ErrUserAborted) || errors.Is(err, fuzzyfinder.ErrAbort)
-}
-
-func run(ctx context.Context, cfg *config.Config, keyDir string, vaultTempDir *string, version string) error {
-	vlt := connectVault(*cfg)
-	ui.PrintBanner(keyDir, vlt != nil, version)
-
-	for {
-		sess, err := chooseSession(ctx, cfg, &keyDir, vlt, vaultTempDir)
-		if err != nil {
-			return err
-		}
-		cfg.AddRecent(config.Recent{User: sess.User, Host: sess.Host, Key: sess.recentKey()})
-
-		switchConn, err := actionLoop(ctx, sess)
-		if err != nil {
-			return err
-		}
-		if !switchConn {
-			ui.PrintNote("Bye!")
-			return nil
-		}
-	}
+	return errors.Is(err, huh.ErrUserAborted) || errors.Is(err, errBrowseCancelled) ||
+		errors.Is(err, tea.ErrInterrupted)
 }
 
 func fatal(vaultTempDir *string, format string, args ...any) {
