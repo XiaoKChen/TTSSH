@@ -34,8 +34,10 @@ var (
 	Warning = lipgloss.AdaptiveColor{Light: "#9A6700", Dark: "#D29922"}
 	// Error marks failures.
 	Error = lipgloss.AdaptiveColor{Light: "#CF222E", Dark: "#F85149"}
-	// SelectionBg is the background of the selected list row.
-	SelectionBg = lipgloss.AdaptiveColor{Light: "#ECE8FF", Dark: "#2B2745"}
+	// Highlight is the strongest neutral: black on light terminals, white on dark.
+	Highlight = lipgloss.AdaptiveColor{Light: "#000000", Dark: "#FFFFFF"}
+	// SelectionBg is the neutral grey background of the selected list row.
+	SelectionBg = lipgloss.AdaptiveColor{Light: "#E4E4E7", Dark: "#2A2A2E"}
 )
 
 // Styles shared by the CLI output and the dashboard.
@@ -110,15 +112,15 @@ func ListStyles() list.Styles {
 	return s
 }
 
-// ListItemStyles styles list rows. The selected row carries a left bar, so
-// selection never depends on color alone.
+// ListItemStyles styles list rows. The selected row is monochrome and
+// carries a left bar, so selection never depends on color alone.
 func ListItemStyles() list.DefaultItemStyles {
 	s := list.NewDefaultItemStyles()
 	s.NormalTitle = lipgloss.NewStyle().Foreground(Text).Padding(0, 0, 0, 2)
 	s.SelectedTitle = lipgloss.NewStyle().
 		Border(lipgloss.ThickBorder(), false, false, false, true).
-		BorderForeground(Accent).
-		Foreground(Accent).
+		BorderForeground(Highlight).
+		Foreground(Highlight).
 		Background(SelectionBg).
 		Bold(true).
 		Padding(0, 0, 0, 1)

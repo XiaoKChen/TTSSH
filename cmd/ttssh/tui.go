@@ -41,7 +41,7 @@ const (
 // keyMap holds every binding the dashboard shows in its help footer.
 type keyMap struct {
 	Up, Down, Filter, Back, Cancel, Help, Quit, ForceQuit key.Binding
-	Connect, Upload, Download, New, Remove                key.Binding
+	Connect, Upload, Download, New, Remove, ClearAll      key.Binding
 	Select, Folder, Pull                                  key.Binding
 	Open, Parent, UseDir, TypePath                        key.Binding
 	Yes, No                                               key.Binding
@@ -65,6 +65,7 @@ func newKeyMap() keyMap {
 		Download:  bind("d", "download", "d"),
 		New:       bind("n", "new", "n"),
 		Remove:    bind("x", "remove", "x"),
+		ClearAll:  bind("X", "clear all", "X"),
 		Select:    bind("enter", "select", "enter"),
 		Folder:    bind("f", "change folder", "f"),
 		Pull:      bind("p", "download vault keys", "p"),
@@ -72,8 +73,8 @@ func newKeyMap() keyMap {
 		Parent:    bind("←/h", "parent folder", "backspace", "ctrl+h", "h", "left"),
 		UseDir:    bind("space", "use this folder", " ", "."),
 		TypePath:  bind("t", "type a path", "t"),
-		Yes:       bind("y", "remove", "y", "Y"),
-		No:        bind("n/esc", "keep", "n", "N", "esc"),
+		Yes:       bind("y", "confirm", "y", "Y"),
+		No:        bind("n/esc", "cancel", "n", "N", "esc"),
 	}
 }
 
@@ -97,7 +98,6 @@ type itemKind int
 
 const (
 	itemNone itemKind = iota // zero value: nothing selected
-	itemNewConnection
 	itemRecent
 	itemVaultKey
 	itemLocalKey
@@ -247,6 +247,13 @@ type execDoneMsg struct {
 	err     error
 }
 
+// confirmation is a y/n question shown in the status line; onYes runs when
+// the user confirms.
+type confirmation struct {
+	prompt string
+	onYes  func(m *model) tea.Cmd
+}
+
 // model is the dashboard. It is used through a pointer so callbacks can
 // mutate it; Bubble Tea only calls Update and View from its event loop.
 type model struct {
@@ -266,13 +273,13 @@ type model struct {
 	width   int
 	height  int
 
-	op       *operation
-	lastOpID int
-	status   status
-	lastStID int
-	removing *config.Recent // recent awaiting the x confirmation
-	quitting bool
-	startup  tea.Cmd
+	op         *operation
+	lastOpID   int
+	status     status
+	lastStID   int
+	confirming *confirmation // y/n question awaiting an answer
+	quitting   bool
+	startup    tea.Cmd
 }
 
 func newModel(ctx context.Context, cfg *config.Config, vlt *vault.Client, tempDir *string, keyDir, version string) *model {
@@ -422,8 +429,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	switch {
 	case s == nil:
 		return nil
-	case m.removing != nil:
-		return m.confirmRemoveKey(msg)
+	case m.confirming != nil:
+		return m.confirmKey(msg)
 	case m.op != nil && m.op.blocking:
 		if key.Matches(msg, m.keys.Cancel) {
 			m.stopOp()
@@ -622,8 +629,8 @@ func (m *model) bodyView(s *screen, height int) string {
 func (m *model) statusView() string {
 	var line string
 	switch {
-	case m.removing != nil:
-		line = ui.WarnStyle.Render("? Remove "+m.removing.User+"@"+m.removing.Host+" from recents?") +
+	case m.confirming != nil:
+		line = ui.WarnStyle.Render("? "+m.confirming.prompt) +
 			ui.MutedStyle.Render("  y / n")
 	case m.op != nil:
 		line = m.spinner.View() + " " + m.op.label
@@ -681,7 +688,7 @@ func (m *model) helpKeys() ([]key.Binding, [][]key.Binding) {
 	switch {
 	case s == nil:
 		return nil, nil
-	case m.removing != nil:
+	case m.confirming != nil:
 		only = []key.Binding{m.keys.Yes, m.keys.No}
 	case m.op != nil && m.op.blocking:
 		only = []key.Binding{m.keys.Cancel, m.keys.ForceQuit}

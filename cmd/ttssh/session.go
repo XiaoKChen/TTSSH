@@ -48,8 +48,9 @@ func run(ctx context.Context, cfg *config.Config, keyDir string, vaultTempDir *s
 func (m *model) pushDashboard() tea.Cmd {
 	s := &screen{
 		kind:    screenDashboard,
-		list:    newList("Connections", "entry", "entries", m.connectionItems()),
-		actions: []key.Binding{m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.New, m.keys.Remove},
+		list:    newList("Connections", "connection", "connections", m.connectionItems()),
+		actions: []key.Binding{m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.New, m.keys.Remove, m.keys.ClearAll},
+		empty:   "No recent connections yet.\nPress n to set one up.",
 		details: m.connectionDetails,
 		onKey:   dashboardKey,
 		onBack:  func(*model) tea.Cmd { return nil }, // the root has nowhere to go back to
@@ -58,12 +59,12 @@ func (m *model) pushDashboard() tea.Cmd {
 }
 
 func (m *model) connectionItems() []item {
-	items := make([]item, 0, len(m.cfg.Recents)+1)
+	items := make([]item, 0, len(m.cfg.Recents))
 	for _, r := range m.cfg.Recents {
 		label := fmt.Sprintf("%-24s %-18s %s", r.User+"@"+r.Host, recentKeyName(r), ui.RelTime(r.LastUsed))
 		items = append(items, item{kind: itemRecent, label: label, recent: r})
 	}
-	return append(items, item{kind: itemNewConnection, label: "＋ New connection"})
+	return items
 }
 
 // recentKeyName is the short key label: the file name, or ☁ unit for vault keys.
@@ -81,7 +82,9 @@ func (m *model) refreshDashboard(index int) tea.Cmd {
 	items := m.connectionItems()
 	s.list.ResetFilter()
 	cmd := s.list.SetItems(toListItems(items))
-	s.list.Select(min(max(index, 0), len(items)-1))
+	if len(items) > 0 {
+		s.list.Select(min(max(index, 0), len(items)-1))
+	}
 	return cmd
 }
 
@@ -91,13 +94,6 @@ func (m *model) connectionDetails(it item) string {
 	}
 	hint := func(k, desc string) string {
 		return ui.KeyStyle.Render(fmt.Sprintf("%-6s", k)) + " " + desc + "\n"
-	}
-	if it.kind == itemNewConnection {
-		text := "Pick a key, then enter the user and host.\n\n" + hint("enter", "set up a new connection")
-		if len(m.cfg.Recents) == 0 {
-			text = ui.MutedStyle.Render("No recent connections yet.") + "\n\n" + text
-		}
-		return text
 	}
 	r := it.recent
 	keyDesc := r.Key
@@ -111,7 +107,10 @@ func (m *model) connectionDetails(it item) string {
 		hint("enter", "ssh into the host") +
 		hint("u", "upload a file to the host") +
 		hint("d", "download a file from the host") +
-		hint("x", "remove from recents")
+		hint("x", "remove from recents") +
+		"\n" +
+		hint("n", "new connection") +
+		hint("X", "clear all recents")
 }
 
 func dashboardKey(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
@@ -119,36 +118,54 @@ func dashboardKey(m *model, msg tea.KeyMsg) (tea.Cmd, bool) {
 	switch {
 	case key.Matches(msg, m.keys.New):
 		return m.openKeyPicker(), true
-	case key.Matches(msg, m.keys.Connect) && it.kind == itemNewConnection:
-		return m.openKeyPicker(), true
-	case !key.Matches(msg, m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.Remove):
+	case !key.Matches(msg, m.keys.Connect, m.keys.Upload, m.keys.Download, m.keys.Remove, m.keys.ClearAll):
 		return nil, false
 	case it.kind != itemRecent:
-		return m.setStatus(statusInfo, "Select a connection first."), true
+		return m.setStatus(statusInfo, "No connections yet — press n to add one."), true
 	case key.Matches(msg, m.keys.Connect):
 		return m.connect(it.recent, m.sshInto), true
 	case key.Matches(msg, m.keys.Upload):
 		return m.connect(it.recent, m.startUpload), true
 	case key.Matches(msg, m.keys.Download):
 		return m.connect(it.recent, m.startDownload), true
-	default: // remove
+	case key.Matches(msg, m.keys.Remove):
 		r := it.recent
-		m.removing = &r
+		m.confirming = &confirmation{
+			prompt: "Remove " + r.User + "@" + r.Host + " from recents?",
+			onYes: func(m *model) tea.Cmd {
+				index := m.stack[0].list.GlobalIndex()
+				m.cfg.RemoveRecent(r)
+				return tea.Batch(m.refreshDashboard(index),
+					m.setStatus(statusSuccess, "Removed "+r.User+"@"+r.Host+" from recents."))
+			},
+		}
+		return nil, true
+	default: // clear all
+		m.confirming = &confirmation{
+			prompt: fmt.Sprintf("Clear all %d recent connections?", len(m.cfg.Recents)),
+			onYes:  clearRecents,
+		}
 		return nil, true
 	}
 }
 
-func (m *model) confirmRemoveKey(msg tea.KeyMsg) tea.Cmd {
-	r := *m.removing
+func clearRecents(m *model) tea.Cmd {
+	m.cfg.Recents = nil
+	refresh := m.refreshDashboard(0)
+	if err := m.cfg.Save(); err != nil {
+		return tea.Batch(refresh, m.setStatus(statusError, "Cleared for this session, but saving failed: "+err.Error()))
+	}
+	return tea.Batch(refresh, m.setStatus(statusSuccess, "Cleared all recent connections."))
+}
+
+func (m *model) confirmKey(msg tea.KeyMsg) tea.Cmd {
+	c := m.confirming
 	switch {
 	case key.Matches(msg, m.keys.Yes):
-		m.removing = nil
-		index := m.stack[0].list.GlobalIndex()
-		m.cfg.RemoveRecent(r)
-		return tea.Batch(m.refreshDashboard(index),
-			m.setStatus(statusSuccess, "Removed "+r.User+"@"+r.Host+" from recents."))
+		m.confirming = nil
+		return c.onYes(m)
 	case key.Matches(msg, m.keys.No):
-		m.removing = nil
+		m.confirming = nil
 	}
 	return nil
 }

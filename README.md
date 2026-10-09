@@ -21,8 +21,8 @@ ttssh
 - **Header** — the version, the vault state (`☁ vault` or `vault off`), and the
   active key folder.
 - **Connections** (left) — your 10 most recent connections, most recent first,
-  with the key name (`☁ unit` for vault keys) and how long ago you used it,
-  plus **＋ New connection**. Press `/` to filter.
+  with the key name (`☁ unit` for vault keys) and how long ago you used it.
+  Press `/` to filter.
 - **Details** (right) — the selected connection's target, key, last use, and
   the actions available. Hidden when the terminal is narrower than 80 columns.
 - **Status line** — results and warnings (`✓` success, `!` warning, `✗` error),
@@ -40,7 +40,7 @@ From the dashboard:
   lists its files over SSH, you filter and pick one, then enter the local
   destination (default `.`). If the remote can't be listed (or would need a
   password/passphrase prompt), you type the remote path instead.
-- **n** (or enter on **＋ New connection**) — set up a new connection:
+- **n** — set up a new connection:
   - **Pick a key** — vault keys (when the vault is configured) and the `*.key`
     files in your key folder (default `~/.ssh`); the details pane shows each
     key's path, size, and modified time, or its vault fingerprint and status.
@@ -49,10 +49,11 @@ From the dashboard:
   - **Enter the target** — username and IP/hostname. The connection is added
     to the top of the list, ready for enter/u/d.
 - **x** — remove the selected connection from the list (asks y/n first).
+- **X** — clear every recent connection (asks y/n first).
 
 `esc` clears an active filter or goes back one step, from any screen. Recent
 entries whose key file has been deleted are pruned automatically;
-`ttssh clear-recents` forgets the whole list.
+`ttssh clear-recents` also forgets the whole list from the command line.
 
 ### Keybindings
 
@@ -69,6 +70,7 @@ entries whose key file has been deleted are pruned automatically;
 | | `d` | download a file from the host |
 | | `n` | new connection |
 | | `x` | remove the selected connection (`y` confirms) |
+| | `X` | clear all recent connections (`y` confirms) |
 | Key picker | `enter` | use the selected key |
 | | `f` | change the key folder |
 | | `p` | download vault keys to a folder |

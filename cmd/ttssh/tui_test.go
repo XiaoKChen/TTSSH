@@ -75,7 +75,7 @@ func TestScreenTransitions(t *testing.T) {
 	}{
 		{"n opens the key picker", sampleRecents(), []string{"n"}, []screenKind{screenDashboard, screenKeys}},
 		{"esc goes back to the dashboard", sampleRecents(), []string{"n", "esc"}, []screenKind{screenDashboard}},
-		{"enter on new connection opens the key picker", nil, []string{"enter"}, []screenKind{screenDashboard, screenKeys}},
+		{"enter with no connections stays on the dashboard", nil, []string{"enter"}, []screenKind{screenDashboard}},
 		{"f opens the folder browser", nil, []string{"n", "f"}, []screenKind{screenDashboard, screenKeys, screenFolders}},
 		{"enter on a key asks for the target", nil, []string{"n", "enter"}, []screenKind{screenDashboard, screenKeys, screenForm}},
 		{"esc backs out of the target form", nil, []string{"n", "enter", "esc"}, []screenKind{screenDashboard, screenKeys}},
@@ -121,7 +121,7 @@ func TestQuitKey(t *testing.T) {
 	}
 }
 
-func TestRemoveRecent(t *testing.T) {
+func TestRemoveRecents(t *testing.T) {
 	tests := []struct {
 		name      string
 		keys      []string
@@ -130,6 +130,8 @@ func TestRemoveRecent(t *testing.T) {
 		{"x then y removes the selected recent", []string{"x", "y"}, []string{"beta"}},
 		{"x then n keeps it", []string{"x", "n"}, []string{"alpha", "beta"}},
 		{"x then esc keeps it", []string{"x", "esc"}, []string{"alpha", "beta"}},
+		{"X then y clears every recent", []string{"X", "y"}, nil},
+		{"X then n keeps them all", []string{"X", "n"}, []string{"alpha", "beta"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,7 +144,10 @@ func TestRemoveRecent(t *testing.T) {
 			if !slices.Equal(hosts, tc.wantHosts) {
 				t.Errorf("recents = %v, want %v", hosts, tc.wantHosts)
 			}
-			if m.removing != nil {
+			if got := len(m.top().list.Items()); got != len(tc.wantHosts) {
+				t.Errorf("list shows %d rows, want %d", got, len(tc.wantHosts))
+			}
+			if m.confirming != nil {
 				t.Error("confirmation still pending")
 			}
 		})
