@@ -455,3 +455,56 @@ func TestAsyncResults(t *testing.T) {
 		})
 	}
 }
+
+func TestEditConnection(t *testing.T) {
+	tests := []struct {
+		name       string
+		keys       []string
+		wantEntry  config.Entry // expected in Prod; zero means the tree is unchanged
+		wantStatus string
+	}{
+		{
+			name:       "changing the host keeps the entry in its folder",
+			keys:       []string{"down", "down", "down", "/", "e", "enter", "backspace", "backspace", "backspace", "backspace", "backspace", "newhost", "enter", "enter"},
+			wantEntry:  config.Entry{User: "root", Host: "newhost", Key: "/keys/a.key"},
+			wantStatus: "Updated root@newhost",
+		},
+		{
+			name:       "choosing no key makes the entry keyless",
+			keys:       []string{"down", "down", "down", "/", "e", "enter", "enter", "down", "down", "enter"},
+			wantEntry:  config.Entry{User: "root", Host: "alpha"},
+			wantStatus: "Updated root@alpha",
+		},
+		{
+			name:       "a recent has no edit shortcut",
+			keys:       []string{"down", "down", "down", "down", "down", "/", "e"},
+			wantStatus: `no shortcut "e"`,
+		},
+		{
+			name:       "a folder has no edit shortcut",
+			keys:       []string{"/", "e"},
+			wantStatus: `no shortcut "e"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModelConfig(t, config.Config{Saved: savedTree(), Recents: sampleRecents()})
+			recents := slices.Clone(m.cfg.Recents)
+			press(m, tc.keys...)
+			prod, _ := m.cfg.Saved.Find([]string{"Prod"})
+			want := config.Entry{User: "root", Host: "alpha", Key: "/keys/a.key"}
+			if tc.wantEntry != (config.Entry{}) {
+				want = tc.wantEntry
+			}
+			if !slices.Equal(prod.Entries, []config.Entry{want}) {
+				t.Errorf("Prod entries = %v, want [%v]", prod.Entries, want)
+			}
+			if !slices.Equal(m.cfg.Recents, recents) {
+				t.Errorf("recents = %v, want unchanged %v", m.cfg.Recents, recents)
+			}
+			if m.status.text != tc.wantStatus {
+				t.Errorf("status = %q, want %q", m.status.text, tc.wantStatus)
+			}
+		})
+	}
+}

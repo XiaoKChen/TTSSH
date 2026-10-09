@@ -66,6 +66,8 @@ Dashboard commands (after `/`):
   destination (default `.`). If the remote can't be listed (key hosts that need
   a passphrase prompt, or any password login), you type the remote path instead.
 - **a** — save the selected recent connection into a folder.
+- **e** — edit the selected saved connection: change its username, host, or key
+  (keep it, pick another from the key picker, or switch to password login).
 - **m** — move the selected connection or folder to another folder (or the top
   level).
 - **f** — new folder, inside the selected folder (or the selected connection's
@@ -84,7 +86,8 @@ connection jumps to its folder. Folders start expanded each run.
 ### Saved folders
 
 Saved connections live in `config.json` under `saved`, as nested folders that
-you create and rearrange with the commands above. Connecting to a saved entry
+you create and rearrange with the commands above. You can edit a saved
+connection's username, host and key in place with `/ e`. Connecting to a saved entry
 also bumps it into your recents. Recents whose key file was deleted are pruned
 automatically; saved entries are never removed automatically — a missing key
 file or vault unit only shows a warning. `ttssh clear-recents` forgets the

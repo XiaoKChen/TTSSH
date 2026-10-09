@@ -337,6 +337,24 @@ func (c *Config) RemoveEntry(path []string, e Entry) error {
 	return nil
 }
 
+// UpdateEntry replaces old with updated in place, keeping its position.
+// Nothing changes on error.
+func (c *Config) UpdateEntry(folder []string, old, updated Entry) error {
+	src, ok := c.Saved.Find(folder)
+	if !ok {
+		return ErrFolderNotFound
+	}
+	i := slices.Index(src.Entries, old)
+	if i < 0 {
+		return ErrEntryNotFound
+	}
+	if j := slices.Index(src.Entries, updated); j >= 0 && j != i {
+		return ErrEntryExists
+	}
+	src.Entries[i] = updated
+	return nil
+}
+
 // MoveEntry moves e from one folder to another. Nothing changes on error.
 func (c *Config) MoveEntry(from []string, e Entry, to []string) error {
 	src, ok := c.Saved.Find(from)

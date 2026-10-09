@@ -148,6 +148,68 @@ func TestFolderOperations(t *testing.T) {
 			wantPaths: [][]string{{"Prod"}, {"Dev"}, {"EU"}},
 		},
 		{
+			name: "updates an entry in a nested folder keeping its position",
+			op: func(c *Config) error {
+				if err := c.AddEntry([]string{"Prod", "EU"}, entryB); err != nil {
+					return err
+				}
+				return c.UpdateEntry([]string{"Prod", "EU"}, entryA, Entry{User: "u", Host: "h", Key: "vault:X"})
+			},
+			check: func(t *testing.T, c *Config) {
+				f, _ := c.Saved.Find([]string{"Prod", "EU"})
+				want := []Entry{{User: "u", Host: "h", Key: "vault:X"}, entryB}
+				if !reflect.DeepEqual(f.Entries, want) {
+					t.Errorf("entries = %v, want %v", f.Entries, want)
+				}
+			},
+		},
+		{
+			name: "rejects an update that duplicates another entry",
+			op: func(c *Config) error {
+				if err := c.AddEntry([]string{"Prod"}, entryA); err != nil {
+					return err
+				}
+				return c.UpdateEntry([]string{"Prod"}, entryB, entryA)
+			},
+			wantErr: ErrEntryExists,
+		},
+		{
+			name:    "rejects updating a missing entry",
+			op:      func(c *Config) error { return c.UpdateEntry([]string{"Prod"}, entryA, entryB) },
+			wantErr: ErrEntryNotFound,
+		},
+		{
+			name:    "rejects updating in a missing folder",
+			op:      func(c *Config) error { return c.UpdateEntry([]string{"Nope"}, entryA, entryB) },
+			wantErr: ErrFolderNotFound,
+		},
+		{
+			name: "a no-op update succeeds",
+			op:   func(c *Config) error { return c.UpdateEntry([]string{"Prod"}, entryB, entryB) },
+		},
+		{
+			name: "a keyless entry can be given a key",
+			op: func(c *Config) error {
+				return c.UpdateEntry([]string{"Prod"}, entryB, Entry{User: entryB.User, Host: entryB.Host, Key: "/k/b.key"})
+			},
+			check: func(t *testing.T, c *Config) {
+				if f, _ := c.Saved.Find([]string{"Prod"}); f.Entries[0].Key != "/k/b.key" {
+					t.Errorf("key = %q", f.Entries[0].Key)
+				}
+			},
+		},
+		{
+			name: "a keyed entry can be made keyless",
+			op: func(c *Config) error {
+				return c.UpdateEntry([]string{"Prod", "EU"}, entryA, Entry{User: entryA.User, Host: entryA.Host})
+			},
+			check: func(t *testing.T, c *Config) {
+				if f, _ := c.Saved.Find([]string{"Prod", "EU"}); f.Entries[0].Key != "" {
+					t.Errorf("key = %q", f.Entries[0].Key)
+				}
+			},
+		},
+		{
 			name:    "rejects moving a folder into its own descendant",
 			op:      func(c *Config) error { return c.MoveFolder([]string{"Prod"}, []string{"Prod", "EU"}) },
 			wantErr: ErrMoveIntoSelf,

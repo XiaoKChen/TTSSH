@@ -33,9 +33,9 @@ type keyPicker struct {
 	loading bool // vault units are still being fetched
 }
 
-// openKeyPicker starts the new-connection flow: pick a key, then the target.
+// openKeyPicker shows the key picker and passes the chosen key to pick.
 // Local keys show at once; vault units are loaded in the background.
-func (m *model) openKeyPicker() tea.Cmd {
+func (m *model) openKeyPicker(pick func(m *model, keyItem item) tea.Cmd) tea.Cmd {
 	p := &keyPicker{}
 	s := &screen{
 		kind:      screenKeys,
@@ -55,7 +55,7 @@ func (m *model) openKeyPicker() tea.Cmd {
 			return nil, false
 		}
 		if it := s.selected(); it.kind != itemNone {
-			return m.askTarget(it), true
+			return pick(m, it), true
 		}
 		return nil, true
 	}
@@ -129,13 +129,7 @@ func keyDetails(it item) string {
 // folder to save the connection in. The connection always enters the recents
 // and is selected on the dashboard.
 func (m *model) askTarget(keyItem item) tea.Cmd {
-	keyRef, keyLabel := keyItem.value, keyItem.value
-	switch keyItem.kind {
-	case itemVaultKey:
-		keyRef, keyLabel = vaultRecentPrefix+keyItem.value, vaultLabel(keyItem.value)
-	case itemNoKey:
-		keyLabel = passwordKeyName + " (ssh asks for it; never stored)"
-	}
+	keyRef, keyLabel := keyChoice(keyItem)
 
 	choices := append([]folderChoice{{label: dontSaveLabel, none: true}}, m.folderChoices(nil)...)
 	saveIdx := 0
@@ -174,6 +168,18 @@ func (m *model) askTarget(keyItem item) tea.Cmd {
 		return m.finishTreeChange(nil, "Saved "+r.User+"@"+r.Host+" to "+dest.label+" — press enter to connect.",
 			item{kind: itemEntry, entry: entry, path: dest.path}.id())
 	}))
+}
+
+// keyChoice is the stored key reference of a picked key row and its label.
+func keyChoice(keyItem item) (keyRef, keyLabel string) {
+	keyRef, keyLabel = keyItem.value, keyItem.value
+	switch keyItem.kind {
+	case itemVaultKey:
+		keyRef, keyLabel = vaultRecentPrefix+keyItem.value, vaultLabel(keyItem.value)
+	case itemNoKey:
+		keyRef, keyLabel = "", passwordKeyName+" (ssh asks for it; never stored)"
+	}
+	return keyRef, keyLabel
 }
 
 func noSpaces(what string) func(string) error {

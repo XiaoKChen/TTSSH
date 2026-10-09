@@ -214,6 +214,7 @@ func (m *model) dashboardDetails(it item) string {
 			cmdHint("enter", "ssh into the host") +
 			cmdHint("/ u", "upload a file") +
 			cmdHint("/ d", "download a file") +
+			cmdHint("/ e", "edit connection") +
 			cmdHint("/ m", "move to a folder") +
 			cmdHint("/ x", "remove")
 	default:
@@ -274,7 +275,9 @@ func (m *model) connectEntry(it item, then func(session) tea.Cmd) tea.Cmd {
 // dashboardCommands lists the "/" commands that make sense for the selection.
 func dashboardCommands(m *model) []command {
 	it := m.top().selected()
-	cmds := []command{{"n", "new connection", func(m *model) tea.Cmd { return m.openKeyPicker() }}}
+	cmds := []command{{"n", "new connection", func(m *model) tea.Cmd {
+		return m.openKeyPicker(func(m *model, keyItem item) tea.Cmd { return m.askTarget(keyItem) })
+	}}}
 
 	if it.kind == itemEntry || it.kind == itemRecent {
 		connect := func(then func(session) tea.Cmd) func(m *model) tea.Cmd {
@@ -294,6 +297,9 @@ func dashboardCommands(m *model) []command {
 		cmds = append(cmds, command{"a", "save to a folder", func(m *model) tea.Cmd { return m.saveRecent(it.recent) }})
 	case itemEntry, itemFolder:
 		cmds = append(cmds, command{"m", "move to a folder", func(m *model) tea.Cmd { return m.moveRow(it) }})
+	}
+	if it.kind == itemEntry {
+		cmds = append(cmds, command{"e", "edit connection", func(m *model) tea.Cmd { return m.editEntry(it) }})
 	}
 	cmds = append(cmds, command{"f", "new folder", func(m *model) tea.Cmd { return m.newFolder(it) }})
 	if it.kind == itemFolder {
@@ -438,6 +444,48 @@ func (m *model) moveRow(it item) tea.Cmd {
 		return m.finishTreeChange(err, "Moved "+e.User+"@"+e.Host+" to "+pathLabel(dest)+".",
 			item{kind: itemEntry, entry: e, path: dest}.id())
 	})
+}
+
+// Choices of the edit form's key field.
+const (
+	keepKey   = "keep"
+	pickKey   = "pick"
+	removeKey = "none"
+)
+
+// editEntry edits the user, host and key of a saved entry. Choosing a
+// different key continues in the key picker; esc there changes nothing.
+func (m *model) editEntry(it item) tea.Cmd {
+	old := it.entry
+	user, host, keyAction := old.User, old.Host, keepKey
+	form := newForm(huh.NewGroup(
+		huh.NewInput().Title("Username").Validate(noSpaces("username")).Value(&user),
+		huh.NewInput().Title("Host (IP or hostname)").Validate(noSpaces("host")).Value(&host),
+		huh.NewSelect[string]().Title("Key").Options(
+			huh.NewOption("Keep current: "+keyName(old.Key), keepKey),
+			huh.NewOption("Choose a different key…", pickKey),
+			huh.NewOption(noKeyLabel, removeKey),
+		).Value(&keyAction),
+	).Title("Edit connection").Description(pathLabel(it.path)))
+	save := func(m *model, key string) tea.Cmd {
+		updated := config.Entry{User: strings.TrimSpace(user), Host: strings.TrimSpace(host), Key: key}
+		err := m.cfg.UpdateEntry(it.path, old, updated)
+		return m.finishTreeChange(err, "Updated "+updated.User+"@"+updated.Host,
+			item{kind: itemEntry, entry: updated, path: it.path}.id())
+	}
+	return m.push(formScreen(form, func(m *model) tea.Cmd {
+		switch keyAction {
+		case pickKey:
+			return m.openKeyPicker(func(m *model, keyItem item) tea.Cmd {
+				m.popTo(1)
+				keyRef, _ := keyChoice(keyItem)
+				return save(m, keyRef)
+			})
+		case removeKey:
+			return save(m, "")
+		}
+		return save(m, old.Key)
+	}))
 }
 
 // ---- folder choosers ----
